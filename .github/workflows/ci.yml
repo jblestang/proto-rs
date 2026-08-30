@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  RUSTDOCFLAGS: -Dwarnings
+
+jobs:
+  quality:
+    name: Format, lint, test, and document
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check every crate target
+        run: cargo check --all-targets --all-features
+
+      - name: Run Clippy without warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests and doctests
+        run: cargo test --all-features
+
+      - name: Check alloc-only library build
+        run: cargo check --lib --no-default-features
+
+      - name: Build documentation without warnings
+        run: cargo doc --lib --no-deps --no-default-features
+
+      - name: Check decoder fuzz target
+        run: cargo check --manifest-path fuzz/Cargo.toml --bin decode
+
+      - name: Verify crates.io package
+        run: cargo publish --dry-run
+
+  msrv:
+    name: Minimum Rust 1.88
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install minimum supported Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.88
+
+      - name: Check the alloc-only library on the MSRV
+        run: cargo check --lib --no-default-features
+
+  conformance:
+    name: Official pinned protobuf conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Read the pinned protobuf commit
+        id: protobuf-version
+        shell: bash
+        run: |
+          commit="$(sed -n 's/^upstream commit //p' conformance/VERSION)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the pinned official protobuf source
+        uses: actions/checkout@v6
+        with:
+          repository: protocolbuffers/protobuf
+          ref: ${{ steps.protobuf-version.outputs.commit }}
+          path: target/protobuf-source
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify the upstream checkout
+        run: |
+          test \
+            "$(git -C target/protobuf-source rev-parse HEAD)" = \
+            "${{ steps.protobuf-version.outputs.commit }}"
+
+      - name: Install conformance runner build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            cmake \
+            g++ \
+            ninja-build
+
+      - name: Build the pinned protoc compiler
+        run: |
+          cmake \
+            -S target/protobuf-source \
+            -B target/protobuf-build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS=-Wno-deprecated-declarations \
+            -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$GITHUB_WORKSPACE/target/protobuf-bin" \
+            -Dprotobuf_BUILD_CONFORMANCE=OFF \
+            -Dprotobuf_BUILD_EXAMPLES=OFF \
+            -Dprotobuf_BUILD_SHARED_LIBS=OFF \
+            -Dprotobuf_BUILD_TESTS=OFF \
+            -Dprotobuf_FORCE_FETCH_DEPENDENCIES=ON \
+            -Dprotobuf_INSTALL=OFF
+          cmake --build target/protobuf-build --target protoc --parallel 2
+
+      - name: Build the official conformance runner
+        run: |
+          cmake \
+            -S target/protobuf-source \
+            -B target/protobuf-build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS=-Wno-deprecated-declarations \
+            -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$GITHUB_WORKSPACE/target/protobuf-bin" \
+            -Dprotobuf_BUILD_CONFORMANCE=ON \
+            -Dprotobuf_BUILD_EXAMPLES=OFF \
+            -Dprotobuf_BUILD_SHARED_LIBS=OFF \
+            -Dprotobuf_BUILD_TESTS=OFF \
+            -Dprotobuf_FORCE_FETCH_DEPENDENCIES=ON \
+            -Dprotobuf_INSTALL=OFF \
+            -Dprotobuf_PROTOC_EXE="$GITHUB_WORKSPACE/target/protobuf-bin/protoc"
+          cmake --build \
+            target/protobuf-build \
+            --target conformance_test_runner \
+            --parallel 2
+
+      - name: Run every required and recommended conformance test
+        env:
+          CONFORMANCE_RUNNER: ${{ github.workspace }}/target/protobuf-bin/conformance_test_runner
+          PROTOBUF_SOURCE_ROOT: ${{ github.workspace }}/target/protobuf-source
+        run: bash conformance/run.sh

@@ -1,0 +1,203 @@
+// Protocol Buffers proto2/proto3 grammar used for syntax validation.
+// Semantic constraints and import/type resolution remain in schema.rs.
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ line_comment | block_comment }
+line_comment = _{ "//" ~ (!"\n" ~ ANY)* }
+block_comment = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
+
+proto_file = { SOI ~ syntax_decl? ~ file_item* ~ EOI }
+token_stream = { SOI ~ lexical_token* ~ EOI }
+lexical_token = _{ string_literal | lex_number | lex_identifier | lex_symbol }
+lex_identifier = @{ "."? ~ ident_start ~ ident_continue* ~ ("." ~ ident_start ~ ident_continue*)* }
+lex_number = @{
+    sign? ~ (
+        ("0x" | "0X") ~ ASCII_HEX_DIGIT+
+      | ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT* ~ exponent?
+      | ASCII_DIGIT+ ~ exponent
+      | ASCII_DIGIT+
+      | "." ~ ASCII_DIGIT+ ~ exponent?
+    )
+}
+lex_symbol = @{ ANY }
+file_item = _{
+    import_decl
+  | package_decl
+  | option_decl
+  | message_decl
+  | enum_decl
+  | service_decl
+  | extend_decl
+  | empty_statement
+}
+
+syntax_decl = { KW_SYNTAX ~ "=" ~ syntax_name ~ ";" }
+syntax_name = { string_literal }
+import_decl = { KW_IMPORT ~ (KW_WEAK | KW_PUBLIC)? ~ string_literal ~ ";" }
+package_decl = { KW_PACKAGE ~ full_ident ~ ";" }
+
+message_decl = { KW_MESSAGE ~ identifier ~ "{" ~ message_item* ~ "}" }
+message_item = _{
+    map_field
+  | group_decl
+  | field_decl
+  | oneof_decl
+  | message_decl
+  | enum_decl
+  | option_decl
+  | reserved_decl
+  | extensions_decl
+  | extend_decl
+  | empty_statement
+}
+
+field_decl = { label? ~ field_type ~ identifier ~ "=" ~ int_literal ~ field_options? ~ ";" }
+map_field = {
+    KW_MAP ~ "<" ~ map_key_type ~ "," ~ field_type ~ ">"
+    ~ identifier ~ "=" ~ int_literal ~ field_options? ~ ";"
+}
+group_decl = {
+    label ~ KW_GROUP ~ identifier ~ "=" ~ int_literal
+    ~ "{" ~ message_item* ~ "}" ~ ";"?
+}
+label = { KW_REQUIRED | KW_OPTIONAL | KW_REPEATED }
+
+oneof_decl = { KW_ONEOF ~ identifier ~ "{" ~ oneof_item* ~ "}" }
+oneof_item = _{ oneof_field | option_decl | empty_statement }
+oneof_field = { field_type ~ identifier ~ "=" ~ int_literal ~ field_options? ~ ";" }
+
+enum_decl = { KW_ENUM ~ identifier ~ "{" ~ enum_item* ~ "}" }
+enum_item = _{ enum_value | option_decl | reserved_decl | empty_statement }
+enum_value = { identifier ~ "=" ~ int_literal ~ enum_value_options? ~ ";" }
+enum_value_options = { "[" ~ enum_value_option ~ ("," ~ enum_value_option)* ~ "]" }
+enum_value_option = { option_name ~ "=" ~ constant }
+
+reserved_decl = { KW_RESERVED ~ (reserved_names | reserved_ranges) ~ ";" }
+reserved_names = { string_literal ~ ("," ~ string_literal)* }
+reserved_ranges = { range ~ ("," ~ range)* }
+extensions_decl = { KW_EXTENSIONS ~ range ~ ("," ~ range)* ~ ";" }
+range = { int_literal ~ (KW_TO ~ (int_literal | KW_MAX))? }
+
+extend_decl = { KW_EXTEND ~ type_name ~ "{" ~ extend_item* ~ "}" }
+extend_item = _{ group_decl | field_decl | empty_statement }
+
+service_decl = { KW_SERVICE ~ identifier ~ "{" ~ service_item* ~ "}" }
+service_item = _{ option_decl | rpc_decl | empty_statement }
+rpc_decl = {
+    KW_RPC ~ identifier ~ "(" ~ KW_STREAM? ~ type_name ~ ")"
+    ~ KW_RETURNS ~ "(" ~ KW_STREAM? ~ type_name ~ ")"
+    ~ (";" | "{" ~ (option_decl | empty_statement)* ~ "}")
+}
+
+option_decl = { KW_OPTION ~ option_name ~ "=" ~ constant ~ ";" }
+field_options = { "[" ~ field_option ~ ("," ~ field_option)* ~ "]" }
+field_option = { option_name ~ "=" ~ constant }
+option_name = { option_component ~ ("." ~ option_component)* }
+option_component = { identifier | "(" ~ type_name ~ ")" }
+
+constant = {
+    string_literal+
+  | float_literal
+  | int_literal
+  | full_ident
+  | aggregate_value
+}
+aggregate_value = { "{" ~ aggregate_element* ~ "}" }
+aggregate_element = _{
+    aggregate_value
+  | string_literal
+  | (!("{" | "}" | "\0") ~ ANY)
+}
+
+field_type = {
+    TYPE_DOUBLE | TYPE_FLOAT | TYPE_INT32 | TYPE_INT64 | TYPE_UINT32 | TYPE_UINT64
+  | TYPE_SINT32 | TYPE_SINT64 | TYPE_FIXED32 | TYPE_FIXED64
+  | TYPE_SFIXED32 | TYPE_SFIXED64 | TYPE_BOOL | TYPE_STRING | TYPE_BYTES
+  | type_name
+}
+map_key_type = {
+    TYPE_INT32 | TYPE_INT64 | TYPE_UINT32 | TYPE_UINT64 | TYPE_SINT32 | TYPE_SINT64
+  | TYPE_FIXED32 | TYPE_FIXED64 | TYPE_SFIXED32 | TYPE_SFIXED64 | TYPE_BOOL | TYPE_STRING
+}
+
+identifier = @{ ident_start ~ ident_continue* }
+full_ident = @{ identifier ~ ("." ~ identifier)* }
+type_name = @{ "."? ~ full_ident }
+ident_start = _{ ASCII_ALPHA | "_" }
+ident_continue = _{ ASCII_ALPHANUMERIC | "_" }
+
+int_literal = @{ sign? ~ (hex_integer | octal_integer | decimal_integer) }
+hex_integer = { ("0x" | "0X") ~ ASCII_HEX_DIGIT+ }
+octal_integer = { "0" ~ ASCII_OCT_DIGIT+ }
+decimal_integer = { "0" | nonzero_decimal_digit ~ ASCII_DIGIT* }
+nonzero_decimal_digit = _{ "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" }
+float_literal = @{
+    sign? ~ (
+        ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT* ~ exponent?
+      | ASCII_DIGIT+ ~ exponent
+      | "." ~ ASCII_DIGIT+ ~ exponent?
+      | KW_INF
+      | KW_NAN
+    )
+}
+exponent = { ("e" | "E") ~ sign? ~ ASCII_DIGIT+ }
+sign = { "+" | "-" }
+
+string_literal = @{ single_string | double_string }
+single_string = { "'" ~ single_char* ~ "'" }
+double_string = { "\"" ~ double_char* ~ "\"" }
+single_char = _{ escape | !("'" | "\\" | "\n" | "\r" | "\0") ~ ANY }
+double_char = _{ escape | !("\"" | "\\" | "\n" | "\r" | "\0") ~ ANY }
+escape = _{
+    "\\" ~ (
+        ("x" | "X") ~ ASCII_HEX_DIGIT{1,2}
+      | ASCII_OCT_DIGIT{1,3}
+      | "u" ~ ASCII_HEX_DIGIT{4}
+      | "U" ~ ASCII_HEX_DIGIT{8}
+      | ("a" | "b" | "f" | "n" | "r" | "t" | "v" | "\\" | "'" | "\"")
+    )
+}
+
+empty_statement = { ";" }
+
+KW_SYNTAX = @{ "syntax" ~ !ident_continue }
+KW_IMPORT = @{ "import" ~ !ident_continue }
+KW_WEAK = @{ "weak" ~ !ident_continue }
+KW_PUBLIC = @{ "public" ~ !ident_continue }
+KW_PACKAGE = @{ "package" ~ !ident_continue }
+KW_MESSAGE = @{ "message" ~ !ident_continue }
+KW_ENUM = @{ "enum" ~ !ident_continue }
+KW_ONEOF = @{ "oneof" ~ !ident_continue }
+KW_OPTION = @{ "option" ~ !ident_continue }
+KW_RESERVED = @{ "reserved" ~ !ident_continue }
+KW_EXTENSIONS = @{ "extensions" ~ !ident_continue }
+KW_EXTEND = @{ "extend" ~ !ident_continue }
+KW_TO = @{ "to" ~ !ident_continue }
+KW_MAX = @{ "max" ~ !ident_continue }
+KW_REQUIRED = @{ "required" ~ !ident_continue }
+KW_OPTIONAL = @{ "optional" ~ !ident_continue }
+KW_REPEATED = @{ "repeated" ~ !ident_continue }
+KW_GROUP = @{ "group" ~ !ident_continue }
+KW_MAP = @{ "map" ~ !ident_continue }
+KW_SERVICE = @{ "service" ~ !ident_continue }
+KW_RPC = @{ "rpc" ~ !ident_continue }
+KW_RETURNS = @{ "returns" ~ !ident_continue }
+KW_STREAM = @{ "stream" ~ !ident_continue }
+KW_INF = @{ "inf" ~ !ident_continue }
+KW_NAN = @{ "nan" ~ !ident_continue }
+
+TYPE_DOUBLE = @{ "double" ~ !ident_continue }
+TYPE_FLOAT = @{ "float" ~ !ident_continue }
+TYPE_INT32 = @{ "int32" ~ !ident_continue }
+TYPE_INT64 = @{ "int64" ~ !ident_continue }
+TYPE_UINT32 = @{ "uint32" ~ !ident_continue }
+TYPE_UINT64 = @{ "uint64" ~ !ident_continue }
+TYPE_SINT32 = @{ "sint32" ~ !ident_continue }
+TYPE_SINT64 = @{ "sint64" ~ !ident_continue }
+TYPE_FIXED32 = @{ "fixed32" ~ !ident_continue }
+TYPE_FIXED64 = @{ "fixed64" ~ !ident_continue }
+TYPE_SFIXED32 = @{ "sfixed32" ~ !ident_continue }
+TYPE_SFIXED64 = @{ "sfixed64" ~ !ident_continue }
+TYPE_BOOL = @{ "bool" ~ !ident_continue }
+TYPE_STRING = @{ "string" ~ !ident_continue }
+TYPE_BYTES = @{ "bytes" ~ !ident_continue }

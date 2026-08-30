@@ -1,0 +1,53 @@
+[package]
+name = "proto-rs-dynamic"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A no_std dynamic Protocol Buffers schema parser, sanitizer, and wire codec"
+license = "MIT"
+repository = "https://github.com/jblestang/proto-rs"
+documentation = "https://docs.rs/proto-rs-dynamic"
+readme = "README.md"
+keywords = ["protobuf", "no-std", "parser", "serialization", "sanitization"]
+categories = ["embedded", "encoding", "no-std", "parser-implementations"]
+publish = ["crates-io"]
+include = [
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/CONFORMANCE.md",
+    "/SANITIZATION.md",
+    "/BENCHMARKS.md",
+    "/src/**",
+    "/examples/**",
+    "/benches/**",
+    "/conformance/FEATURES.md",
+]
+
+[lib]
+name = "proto_rs"
+path = "src/lib.rs"
+
+# The library is strictly `no_std`; there is deliberately no `std` feature.
+# Any future optional capability must remain disabled by default and must not
+# make the core library depend on the standard library.
+[features]
+default = []
+
+[dependencies]
+# These crates generate only the parser for the checked-in Pest grammar.
+# User-supplied `.proto` files are runtime data and never generate Rust code.
+pest = { version = "2.8.7", default-features = false }
+pest_derive = { version = "2.8.7", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[package.metadata.docs.rs]
+no-default-features = true
+
+[[bench]]
+name = "strict_throughput"
+harness = false

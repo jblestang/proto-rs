@@ -1,0 +1,1678 @@
+//! Protocol Buffers source parser and descriptor registry.
+//!
+//! # Registry-first loading
+//!
+//! [`Registry`] is the only cross-file source-loading abstraction.
+//! It owns source strings under protobuf import paths.
+//! Callers populate it completely before requesting a parse.
+//! The registry does not open files or contact external services.
+//! Applications may load its contents from any environment-specific source.
+//! Embedded applications can register static strings copied into allocation.
+//! Hosted applications can read files before invoking the parser.
+//! Tests can construct complete virtual source trees in memory.
+//! Re-registering a path replaces the previous source and returns it.
+//! Parsing starts from one registered root path.
+//! Only sources reachable through imports are parsed and merged.
+//! Normal imports must resolve to a registered source.
+//! Public imports must also resolve to a registered source.
+//! Missing weak imports are tolerated.
+//! Direct imports expose their declarations to the importing source.
+//! Only public imports re-export declarations to the next import level.
+//! Cyclic imports terminate through the visited-path set.
+//! Duplicate symbols across loaded sources are rejected.
+//! Registry parsing preserves the root file's package and syntax metadata.
+//!
+//! # Single-source parsing
+//!
+//! [`parse`] remains convenient for schemas without imports.
+//! It parses one source and resolves all locally declared user types.
+//! An unresolved imported type therefore produces a useful error.
+//! Cross-file users should prefer [`Registry::parse`].
+//! Neither entry point has hidden global state.
+//! Neither entry point caches descriptors between calls.
+//! Returned [`Schema`] values own their descriptors and names.
+//!
+//! # Pest grammar and lexical model
+//!
+//! The checked-in `proto.pest` grammar recognizes protobuf syntax.
+//! Pest generates the grammar parser while compiling this crate; parsing a
+//! user-provided `.proto` source never generates Rust code or message types.
+//! The same grammar produces the token stream consumed by descriptor building.
+//! It recognizes protobuf identifiers and qualified identifiers.
+//! A leading dot is retained for absolute type-name resolution.
+//! Decimal, octal, hexadecimal, exponent, signed, and large numeric literals
+//! are retained as text until a grammar position requires an integer.
+//! This permits proto2 default literals larger than a signed 64-bit value.
+//! Field numbers and enum numbers are parsed into bounded integers.
+//! Both single-quoted and double-quoted strings are recognized.
+//! Line comments beginning with `//` are ignored.
+//! Block comments delimited by `/*` and `*/` are ignored.
+//! Unterminated strings and block comments produce offset-bearing errors.
+//! Punctuation is represented as individual symbol tokens.
+//! Whitespace has no semantic meaning outside quoted strings.
+//! The lexer allocates owned token text to simplify later descriptor ownership.
+//!
+//! # File grammar
+//!
+//! Proto2 and proto3 syntax declarations are recognized.
+//! A missing syntax declaration follows the historical proto2 default.
+//! Package declarations qualify top-level messages and enums.
+//! Normal, public, and weak import declarations are retained.
+//! File options are consumed without affecting wire descriptors.
+//! Services are skipped because they do not describe message wire fields.
+//! Unknown or malformed top-level statements are rejected by the grammar.
+//! Valid non-wire declarations are checked syntactically but not retained.
+//!
+//! # Message grammar
+//!
+//! Top-level and nested messages are represented by [`MessageDescriptor`].
+//! Nested names include every enclosing message component.
+//! Message fields retain source declaration order.
+//! Nested enums are stored alongside top-level enums by full name.
+//! Oneof declarations attach a shared group name to member fields.
+//! Reserved names and ranges are parsed and checked against declared fields.
+//! Extension ranges are recognized and skipped in the basic proto2 tier.
+//! Extend blocks are recognized and skipped in the basic proto2 tier.
+//! Legacy group declarations are recognized and structurally skipped.
+//! Skipping groups lets surrounding basic proto2 fields remain usable.
+//! Group wire types and MessageSet semantics remain codec feature exclusions.
+//!
+//! # Field descriptors
+//!
+//! [`Field`] records name, number, cardinality, type, packing, and presence.
+//! It also retains a raw proto2 default literal when one is declared.
+//! Field numbers must be positive.
+//! Field numbers may not exceed 536,870,911.
+//! The implementation-reserved range 19,000 through 19,999 is rejected.
+//! Proto2 `required`, `optional`, and `repeated` labels are retained.
+//! Proto3 unlabeled scalar fields use optional cardinality without presence.
+//! Proto3 explicit `optional` fields have explicit presence.
+//! Oneof members always have explicit presence.
+//! Resolved message fields always have explicit presence.
+//! Map declarations always have repeated cardinality internally.
+//!
+//! # Scalar types
+//!
+//! Every protobuf scalar wire type has a [`FieldType`] variant.
+//! `double` and `float` retain their IEEE width.
+//! `int32` and `int64` retain two's-complement varint semantics.
+//! `uint32` and `uint64` retain unsigned varint semantics.
+//! `sint32` and `sint64` identify zig-zag transformation.
+//! Fixed and signed-fixed variants retain their exact width.
+//! Boolean fields use the varint wire family.
+//! String fields require UTF-8 at codec decode time.
+//! Bytes fields remain opaque.
+//! Message and enum variants retain fully resolved names.
+//! Map variants own resolved key and value types.
+//!
+//! # Type resolution
+//!
+//! User-defined field types are initially retained as source names.
+//! Resolution occurs only after every reachable file has been parsed.
+//! Absolute names beginning with a dot are looked up from the schema root.
+//! Relative names are searched from the innermost message scope outward.
+//! Package scope is naturally visited while walking outward.
+//! An unqualified global candidate is checked last.
+//! Message names resolve to [`FieldType::Message`].
+//! Enum names resolve to [`FieldType::Enum`].
+//! Unknown names cause parsing to fail instead of becoming opaque placeholders.
+//! Cross-file names use the same resolution rules as local names.
+//! This phase also finalizes explicit presence and packing metadata.
+//!
+//! # Enums
+//!
+//! [`Enum`] retains its short name, full name, and ordered values.
+//! [`EnumValue`] retains both symbolic name and signed numeric value.
+//! Negative enum values are supported.
+//! Aliases are retained as independent ordered declarations.
+//! Enum options such as `allow_alias` are consumed but not interpreted.
+//! Unknown enum numbers remain valid at wire decode time.
+//! Proto3 enums must declare a zero-valued first member.
+//! Duplicate numeric values require `option allow_alias = true`.
+//!
+//! # Maps
+//!
+//! Map syntax is represented directly instead of exposing synthetic messages.
+//! Valid key types are signed and unsigned integer families, bool, and string.
+//! Floating-point, bytes, enum, message, and map keys are rejected.
+//! Map values may use any non-map protobuf field type.
+//! User-defined map value names resolve after the import graph is loaded.
+//! Map fields are never packed.
+//! The codec translates map descriptors to synthetic entry wire messages.
+//!
+//! # Packing
+//!
+//! Explicit `[packed = true]` and `[packed = false]` values are retained.
+//! Proto3 packable repeated fields default to packed.
+//! Proto2 packable repeated fields default to unpacked.
+//! An unresolved user type provisionally inherits the file syntax default.
+//! Resolution disables packing if that type is a message.
+//! Resolution retains the packing default if that type is an enum.
+//! Strings, bytes, maps, and messages are always marked unpacked.
+//! Decoding still accepts either representation for packable primitives.
+//!
+//! # Proto2 defaults
+//!
+//! Default option values are stored as raw normalized token text.
+//! Signed integer literals retain their sign.
+//! Large unsigned literals do not overflow the lexer.
+//! Floating exponent literals remain available to reflection callers.
+//! String and bytes defaults retain their decoded quoted contents.
+//! Boolean and enum symbolic defaults retain their identifier text.
+//! The dynamic message map represents wire presence, not accessor defaults.
+//! Callers can inspect [`Field::default`] when an absent-value view is needed.
+//! Encoding never writes an absent field merely because it declares a default.
+//! Required fields remain required independently of their default literal.
+//!
+//! # Options and non-wire declarations
+//!
+//! The parser extracts `packed` and `default` field options.
+//! Other field options are consumed without entering the wire descriptor.
+//! File and message options are skipped at their syntactic boundary.
+//! Custom options are not evaluated.
+//! Reserved names and ranges are not exposed as descriptor collections yet.
+//! RPC service and method declarations are not exposed.
+//! Source-code comments are not retained in descriptors.
+//! These omissions do not change binary field encoding for supported messages.
+//!
+//! # Error reporting
+//!
+//! Parser errors use byte offsets into the currently parsed source.
+//! They identify missing identifiers, symbols, integers, and option values.
+//! Invalid field numbers fail before a descriptor is produced.
+//! Invalid map keys fail before a descriptor is produced.
+//! Unterminated comments, strings, groups, and messages fail parsing.
+//! Missing registry imports name the unresolved import path.
+//! Duplicate imported messages and enums name the conflicting full symbol.
+//! Unknown field types name both the type and resolution scope.
+//! A registry intentionally does not attach filesystem paths to nested errors.
+//! The caller already knows the root and registered sources being parsed.
+//!
+//! # Allocation behavior
+//!
+//! Source text is owned once by the registry.
+//! Lexing creates owned token strings for identifiers and literals.
+//! Descriptors own their final names and collections.
+//! `BTreeMap` provides deterministic lookup without a hashing dependency.
+//! Resolution creates temporary candidate-name vectors.
+//! No allocation is hidden behind a global cache.
+//! Dropping a registry releases its source text independently of parsed schemas.
+//! Dropping a schema releases every descriptor and resolved name.
+//!
+//! # Compatibility tiers
+//!
+//! Full proto3 binary behavior is exercised by the official suite adapter.
+//! Basic proto2 binary behavior uses the same dynamic descriptors and codec.
+//! Basic proto2 includes ordinary scalars, messages, enums, maps, and oneofs.
+//! Basic proto2 includes required-field checks and explicit packing options.
+//! Legacy groups, extensions, and MessageSet are recognized but unsupported.
+//! Editions syntax and feature resolution are not implemented.
+//! JSON and text-format parsing belong to separate future codec layers.
+//! The repository's `CONFORMANCE.md` is the authoritative support declaration.
+
+use crate::{
+    Error, Result,
+    constants::{
+        BOOLEAN_FALSE, BOOLEAN_TRUE, KW_ENUM, KW_EXTEND, KW_EXTENSIONS, KW_GROUP, KW_IMPORT,
+        KW_MAP, KW_MAX, KW_MESSAGE, KW_ONEOF, KW_OPTION, KW_OPTIONAL, KW_PACKAGE, KW_PUBLIC,
+        KW_REPEATED, KW_REQUIRED, KW_RESERVED, KW_SERVICE, KW_SYNTAX, KW_TO, KW_WEAK,
+        LONG_UNICODE_ESCAPE_DIGITS, MAX_FIELD_NUMBER, MIN_FIELD_NUMBER, OPTION_ALLOW_ALIAS,
+        OPTION_DEFAULT, OPTION_PACKED, RESERVED_FIELD_NUMBER_END, RESERVED_FIELD_NUMBER_START,
+        SHORT_UNICODE_ESCAPE_DIGITS, SYNTAX_PROTO2, SYNTAX_PROTO3, TYPE_BOOL, TYPE_BYTES,
+        TYPE_DOUBLE, TYPE_FIXED32, TYPE_FIXED64, TYPE_FLOAT, TYPE_INT32, TYPE_INT64, TYPE_SFIXED32,
+        TYPE_SFIXED64, TYPE_SINT32, TYPE_SINT64, TYPE_STRING, TYPE_UINT32, TYPE_UINT64,
+    },
+};
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use pest::{Parser as _, error::InputLocation};
+
+/// Pest-generated parser for the checked-in proto2/proto3 grammar.
+#[derive(pest_derive::Parser)]
+#[grammar = "proto.pest"]
+struct ProtoSyntaxParser;
+
+/// Converts a Pest diagnostic into the crate's stable offset-bearing error.
+fn pest_error(error: pest::error::Error<Rule>) -> Error {
+    let offset = match error.location {
+        InputLocation::Pos(offset) | InputLocation::Span((offset, _)) => offset,
+    };
+    Error::new(offset, error.to_string())
+}
+
+/// Validates the complete source against the formal Pest grammar.
+fn validate_pest_syntax(source: &str) -> Result<()> {
+    ProtoSyntaxParser::parse(Rule::proto_file, source)
+        .map(|_| ())
+        .map_err(pest_error)
+}
+
+/// Protobuf source-language edition supported by a parsed schema.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Syntax {
+    /// Protocol Buffers version 2 syntax.
+    Proto2,
+    /// Protocol Buffers version 3 syntax.
+    Proto3,
+}
+/// Declared occurrence rule for a protobuf field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Cardinality {
+    /// Field may occur zero or one time semantically.
+    Optional,
+    /// Proto2 field must be present.
+    Required,
+    /// Field may contain an ordered sequence of values.
+    Repeated,
+}
+/// Resolved protobuf field type used by the dynamic codec.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FieldType {
+    /// IEEE-754 double-precision value.
+    Double,
+    /// IEEE-754 single-precision value.
+    Float,
+    /// Signed 32-bit varint.
+    Int32,
+    /// Signed 64-bit varint.
+    Int64,
+    /// Unsigned 32-bit varint.
+    Uint32,
+    /// Unsigned 64-bit varint.
+    Uint64,
+    /// Zig-zag encoded signed 32-bit integer.
+    Sint32,
+    /// Zig-zag encoded signed 64-bit integer.
+    Sint64,
+    /// Little-endian fixed-width unsigned 32-bit integer.
+    Fixed32,
+    /// Little-endian fixed-width unsigned 64-bit integer.
+    Fixed64,
+    /// Little-endian fixed-width signed 32-bit integer.
+    Sfixed32,
+    /// Little-endian fixed-width signed 64-bit integer.
+    Sfixed64,
+    /// Boolean varint.
+    Bool,
+    /// UTF-8 string.
+    String,
+    /// Opaque byte string.
+    Bytes,
+    /// Embedded message identified by its resolved full name.
+    Message(String),
+    /// Enumeration identified by its resolved full name.
+    Enum(String),
+    /// Synthetic map entry containing its key and value types.
+    Map(Box<FieldType>, Box<FieldType>),
+}
+/// Runtime descriptor for one protobuf message field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Field {
+    /// Source-level field name.
+    pub name: String,
+    /// Positive numeric protobuf tag.
+    pub number: u32,
+    /// Optional, required, or repeated occurrence rule.
+    pub cardinality: Cardinality,
+    /// Resolved field value type.
+    pub kind: FieldType,
+    /// Explicit or syntax-derived packed-encoding setting.
+    pub packed: Option<bool>,
+    /// Whether `packed` was written explicitly instead of derived from syntax.
+    pub packed_explicit: bool,
+    /// Containing oneof name when this field is a oneof member.
+    pub oneof: Option<String>,
+    /// Whether this singular field has explicit presence (`optional`,
+    /// `required`, a oneof member, or a message field).
+    pub explicit_presence: bool,
+    /// Raw proto2 default literal, retained for reflection and auditing.
+    pub default: Option<String>,
+}
+/// Runtime descriptor for one protobuf message declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageDescriptor {
+    /// Unqualified source-level message name.
+    pub name: String,
+    /// Package- and nesting-qualified message name.
+    pub full_name: String,
+    /// Fields in declaration order.
+    pub fields: Vec<Field>,
+}
+impl MessageDescriptor {
+    /// Finds a field descriptor by its numeric protobuf tag.
+    pub fn field_by_number(&self, number: u32) -> Option<&Field> {
+        self.fields.iter().find(|field| field.number == number)
+    }
+    /// Finds a field descriptor by its source-level protobuf name.
+    pub fn field_by_name(&self, name: &str) -> Option<&Field> {
+        self.fields.iter().find(|field| field.name == name)
+    }
+}
+/// One named numeric member of a protobuf enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnumValue {
+    /// Source-level enum member name.
+    pub name: String,
+    /// Signed numeric enum value.
+    pub number: i32,
+}
+/// Runtime descriptor for a protobuf enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Enum {
+    /// Unqualified source-level enum name.
+    pub name: String,
+    /// Package- and nesting-qualified enum name.
+    pub full_name: String,
+    /// Declared enumeration members.
+    pub values: Vec<EnumValue>,
+}
+/// Import modifier attached to a protobuf import declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImportKind {
+    /// Required ordinary import.
+    Normal,
+    /// Required import whose declarations are re-exported to importers.
+    Public,
+    /// Optional import that may be absent from the registry.
+    Weak,
+}
+/// Parsed protobuf import declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Import {
+    /// Logical registry path named by the import.
+    pub path: String,
+    /// Import modifier controlling resolution behavior.
+    pub kind: ImportKind,
+}
+/// Fully parsed and type-resolved collection of protobuf declarations.
+#[derive(Clone, Debug)]
+pub struct Schema {
+    /// Syntax declared by the root source.
+    pub syntax: Syntax,
+    /// Optional package declared by the root source.
+    pub package: Option<String>,
+    /// Message descriptors indexed by fully qualified name.
+    pub messages: BTreeMap<String, MessageDescriptor>,
+    /// Enum descriptors indexed by fully qualified name.
+    pub enums: BTreeMap<String, Enum>,
+    /// Import declarations collected from all reachable sources.
+    pub imports: Vec<Import>,
+}
+
+/// An allocation-backed collection of named `.proto` sources.
+///
+/// The registry is the only import resolver used by this crate. Applications
+/// load files, flash-resident strings, network resources, or generated schema
+/// text into it before parsing. The parser itself never performs I/O, which is
+/// essential for the crate's `no_std` contract.
+#[derive(Clone, Debug, Default)]
+pub struct Registry {
+    sources: BTreeMap<String, String>,
+}
+
+impl Registry {
+    /// Creates an empty schema registry.
+    pub const fn new() -> Self {
+        Self {
+            sources: BTreeMap::new(),
+        }
+    }
+
+    /// Registers or replaces a source under its protobuf import path.
+    ///
+    /// The path must match the text used by importing schemas. Returns the
+    /// previously registered source when the path is replaced.
+    pub fn register(
+        &mut self,
+        path: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Option<String> {
+        self.sources.insert(path.into(), source.into())
+    }
+
+    /// Returns the source registered for an exact protobuf import path.
+    pub fn source(&self, path: &str) -> Option<&str> {
+        self.sources.get(path).map(String::as_str)
+    }
+
+    /// Parses a registered root and every transitively imported schema.
+    ///
+    /// `root` is a logical registry path, not a filesystem path. Only sources
+    /// reachable from that root are included in the returned descriptor set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a required source is absent, a source is invalid,
+    /// imported declarations conflict, or a referenced type cannot be resolved.
+    pub fn parse(&self, root: &str) -> Result<Schema> {
+        parse_registry(root, self)
+    }
+
+    /// Reports how many source files are currently registered.
+    pub fn len(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Reports whether no sources have been registered yet.
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+}
+impl Schema {
+    /// Looks up a message by fully qualified name or by this schema's package.
+    ///
+    /// Exact full-name lookup is attempted first. If it fails and the root
+    /// schema declares a package, that package is prepended to `name`.
+    pub fn message(&self, name: &str) -> Option<&MessageDescriptor> {
+        self.messages.get(name).or_else(|| {
+            self.package
+                .as_ref()
+                .and_then(|package| self.messages.get(&format!("{package}.{name}")))
+        })
+    }
+}
+/// Lexical unit retained by the schema parser together with its source offset.
+#[derive(Clone)]
+enum Token {
+    /// Identifier, keyword, or qualified protobuf name.
+    Identifier(String),
+    /// Contents of a single- or double-quoted literal without delimiters.
+    StringLiteral(String),
+    /// Numeric-looking text whose interpretation depends on grammar position.
+    NumberLiteral(String),
+    /// One punctuation character.
+    Symbol(char),
+}
+
+/// Returns whether `value` is one unqualified protobuf identifier.
+fn is_identifier(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Returns whether `value` is a valid dot-qualified protobuf identifier.
+fn is_full_identifier(value: &str, allow_leading_dot: bool) -> bool {
+    let value = if allow_leading_dot {
+        value.strip_prefix('.').unwrap_or(value)
+    } else {
+        value
+    };
+    !value.is_empty() && value.split('.').all(is_identifier)
+}
+
+/// Reserved names and inclusive numeric ranges collected while parsing a body.
+#[derive(Default)]
+struct ReservedDeclarations {
+    names: Vec<String>,
+    ranges: Vec<(i64, i64)>,
+}
+
+/// Rejects Unicode escapes that do not identify a Unicode scalar value.
+///
+/// Pest verifies escape spelling and digit counts. This semantic pass handles
+/// the scalar-value constraint, including surrogate code points and values
+/// above the Unicode maximum.
+fn validate_unicode_escapes(value: &str, offset: usize) -> Result<()> {
+    let bytes = value.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes.get(cursor) != Some(&b'\\') {
+            cursor += 1;
+            continue;
+        }
+        let escape = bytes
+            .get(cursor + 1)
+            .ok_or_else(|| Error::new(offset, "truncated string escape"))?;
+        let digits = match escape {
+            b'u' => SHORT_UNICODE_ESCAPE_DIGITS,
+            b'U' => LONG_UNICODE_ESCAPE_DIGITS,
+            _ => {
+                cursor += 2;
+                continue;
+            }
+        };
+        let digits_start = cursor + 2;
+        let digits_end = digits_start
+            .checked_add(digits)
+            .ok_or_else(|| Error::new(offset, "Unicode escape length overflow"))?;
+        let hexadecimal = value
+            .get(digits_start..digits_end)
+            .ok_or_else(|| Error::new(offset, "truncated Unicode escape"))?;
+        let code_point = u32::from_str_radix(hexadecimal, 16)
+            .map_err(|_| Error::new(offset, "invalid Unicode escape"))?;
+        if char::from_u32(code_point).is_none() {
+            return Err(Error::new(offset, "invalid Unicode scalar value"));
+        }
+        cursor = digits_end;
+    }
+    Ok(())
+}
+
+/// Produces descriptor-builder tokens from Pest's grammar-derived token stream.
+///
+/// Pest discards comments and whitespace and retains byte spans for precise
+/// semantic diagnostics. String delimiters are removed, but escape spelling is
+/// preserved so defaults can be audited without lossy normalization.
+fn lex(source: &str) -> Result<Vec<(Token, usize)>> {
+    let mut parsed = ProtoSyntaxParser::parse(Rule::token_stream, source).map_err(pest_error)?;
+    let stream = parsed
+        .next()
+        .ok_or_else(|| Error::new(0, "Pest returned no token stream"))?;
+    let mut tokens = Vec::new();
+    for pair in stream.into_inner() {
+        let offset = pair.as_span().start();
+        let text = pair.as_str();
+        let token = match pair.as_rule() {
+            Rule::lex_identifier => Token::Identifier(text.to_string()),
+            Rule::lex_number => Token::NumberLiteral(text.to_string()),
+            Rule::string_literal => {
+                let end = text
+                    .len()
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::new(offset, "invalid Pest string span"))?;
+                let contents = text
+                    .get(1..end)
+                    .ok_or_else(|| Error::new(offset, "invalid Pest string boundary"))?;
+                validate_unicode_escapes(contents, offset)?;
+                Token::StringLiteral(contents.to_string())
+            }
+            Rule::lex_symbol => {
+                let symbol = text
+                    .chars()
+                    .next()
+                    .ok_or_else(|| Error::new(offset, "empty Pest symbol span"))?;
+                Token::Symbol(symbol)
+            }
+            Rule::EOI => continue,
+            _ => return Err(Error::new(offset, "unexpected Pest token rule")),
+        };
+        tokens.push((token, offset));
+    }
+    Ok(tokens)
+}
+/// Mutable semantic descriptor-builder state for one protobuf source file.
+struct DescriptorBuilder {
+    /// Lexed tokens paired with byte offsets into the source.
+    tokens: Vec<(Token, usize)>,
+    /// Index of the next token to consume.
+    cursor: usize,
+    /// Syntax controlling default packing and field-presence behavior.
+    syntax: Syntax,
+    /// Package applied to top-level declarations in this source.
+    package: Option<String>,
+    /// Message descriptors accumulated by fully qualified name.
+    messages: BTreeMap<String, MessageDescriptor>,
+    /// Enum descriptors accumulated by fully qualified name.
+    enums: BTreeMap<String, Enum>,
+    /// Import declarations retained for registry graph traversal.
+    imports: Vec<Import>,
+}
+impl DescriptorBuilder {
+    /// Returns the current token's source offset, or zero at end of input.
+    fn offset(&self) -> usize {
+        self.tokens
+            .get(self.cursor)
+            .map(|token| token.1)
+            .unwrap_or(0)
+    }
+    /// Reports whether the current token is the specified identifier.
+    fn peek_identifier(&self, expected: &str) -> bool {
+        matches!(self.tokens.get(self.cursor),Some((Token::Identifier(value),_))if value==expected)
+    }
+    /// Consumes an identifier or reports its source location as an error.
+    fn identifier(&mut self) -> Result<String> {
+        match self.tokens.get(self.cursor).cloned() {
+            Some((Token::Identifier(value), _)) => {
+                self.cursor += 1;
+                Ok(value)
+            }
+            _ => Err(Error::new(self.offset(), "expected identifier")),
+        }
+    }
+    /// Consumes a simple declaration name and rejects qualified identifiers.
+    fn declaration_name(&mut self) -> Result<String> {
+        let offset = self.offset();
+        let name = self.identifier()?;
+        if is_identifier(&name) {
+            Ok(name)
+        } else {
+            Err(Error::new(offset, "invalid protobuf identifier"))
+        }
+    }
+    /// Consumes a package name and validates every dot-separated component.
+    fn package_name(&mut self) -> Result<String> {
+        let offset = self.offset();
+        let name = self.identifier()?;
+        if is_full_identifier(&name, false) {
+            Ok(name)
+        } else {
+            Err(Error::new(offset, "invalid protobuf package name"))
+        }
+    }
+    /// Consumes and parses an integer token.
+    fn integer(&mut self) -> Result<i64> {
+        match self.tokens.get(self.cursor).cloned() {
+            Some((Token::NumberLiteral(value), offset)) => {
+                self.cursor += 1;
+                let (negative, unsigned) = value
+                    .strip_prefix('-')
+                    .map_or((false, value.as_str()), |value| (true, value));
+                let unsigned = unsigned.strip_prefix('+').unwrap_or(unsigned);
+                let (digits, radix) = if let Some(digits) = unsigned
+                    .strip_prefix("0x")
+                    .or_else(|| unsigned.strip_prefix("0X"))
+                {
+                    (digits, 16)
+                } else if unsigned.len() > 1 && unsigned.starts_with('0') {
+                    (unsigned, 8)
+                } else {
+                    (unsigned, 10)
+                };
+                let magnitude = i128::from_str_radix(digits, radix)
+                    .map_err(|_| Error::new(offset, "expected integer"))?;
+                let signed = if negative {
+                    magnitude
+                        .checked_neg()
+                        .ok_or_else(|| Error::new(offset, "integer is out of range"))?
+                } else {
+                    magnitude
+                };
+                i64::try_from(signed).map_err(|_| Error::new(offset, "integer is out of range"))
+            }
+            _ => Err(Error::new(self.offset(), "expected integer")),
+        }
+    }
+    /// Consumes the requested punctuation symbol.
+    fn expect_symbol(&mut self, expected: char) -> Result<()> {
+        if matches!(self.tokens.get(self.cursor),Some((Token::Symbol(value),_))if *value==expected)
+        {
+            self.cursor += 1;
+            Ok(())
+        } else {
+            Err(Error::new(self.offset(), format!("expected '{expected}'")))
+        }
+    }
+    /// Consumes a punctuation symbol when present and reports whether it matched.
+    fn consume_symbol(&mut self, expected: char) -> bool {
+        self.expect_symbol(expected).is_ok()
+    }
+    /// Qualifies a declared or referenced name against its lexical scope.
+    fn qualify(&self, scope: &str, name: &str) -> String {
+        if let Some(name) = name.strip_prefix('.') {
+            name.to_string()
+        } else if scope.is_empty() {
+            self.package
+                .as_ref()
+                .map(|package| format!("{package}.{name}"))
+                .unwrap_or_else(|| name.to_string())
+        } else {
+            format!("{scope}.{name}")
+        }
+    }
+    /// Skips an unsupported declaration through its balanced body or semicolon.
+    fn skip_declaration(&mut self) -> Result<()> {
+        let mut depth = 0;
+        while self.cursor < self.tokens.len() {
+            match self.tokens[self.cursor].0 {
+                Token::Symbol('{') => depth += 1,
+                Token::Symbol('}') if depth == 0 => break,
+                Token::Symbol('}') if depth == 1 => {
+                    self.cursor += 1;
+                    self.consume_symbol(';');
+                    return Ok(());
+                }
+                Token::Symbol('}') => depth -= 1,
+                Token::Symbol(';') if depth == 0 => {
+                    self.cursor += 1;
+                    return Ok(());
+                }
+                _ => {}
+            }
+            self.cursor += 1
+        }
+        Err(Error::new(self.offset(), "unterminated declaration"))
+    }
+    /// Consumes a scalar field-option value in identifier, string, or numeric form.
+    fn option_value(&mut self) -> Result<String> {
+        match self.tokens.get(self.cursor).cloned() {
+            Some((Token::StringLiteral(mut value), _)) => {
+                self.cursor += 1;
+                while let Some((Token::StringLiteral(next), _)) = self.tokens.get(self.cursor) {
+                    value.push_str(next);
+                    self.cursor += 1;
+                }
+                Ok(value)
+            }
+            Some((Token::Identifier(value), _)) | Some((Token::NumberLiteral(value), _)) => {
+                self.cursor += 1;
+                Ok(value)
+            }
+            _ => Err(Error::new(self.offset(), "expected option value")),
+        }
+    }
+
+    /// Parses a reserved-name or reserved-number statement through its semicolon.
+    fn parse_reserved(&mut self, minimum: i64, maximum: i64) -> Result<ReservedDeclarations> {
+        self.identifier()?;
+        let mut reserved = ReservedDeclarations::default();
+        let names = matches!(
+            self.tokens.get(self.cursor),
+            Some((Token::StringLiteral(_), _))
+        );
+        loop {
+            if names {
+                let offset = self.offset();
+                let name = match self.tokens.get(self.cursor).cloned() {
+                    Some((Token::StringLiteral(name), _)) => {
+                        self.cursor += 1;
+                        name
+                    }
+                    _ => return Err(Error::new(offset, "cannot mix reserved names and numbers")),
+                };
+                if !is_identifier(&name) {
+                    return Err(Error::new(offset, "invalid reserved field name"));
+                }
+                reserved.names.push(name);
+            } else {
+                let start = self.integer()?;
+                let end = if self.peek_identifier(KW_TO) {
+                    self.identifier()?;
+                    if self.peek_identifier(KW_MAX) {
+                        self.identifier()?;
+                        maximum
+                    } else {
+                        self.integer()?
+                    }
+                } else {
+                    start
+                };
+                if start < minimum || start > end || end > maximum {
+                    return Err(Error::new(self.offset(), "invalid reserved numeric range"));
+                }
+                reserved.ranges.push((start, end));
+            }
+            if !self.consume_symbol(',') {
+                break;
+            }
+        }
+        self.expect_symbol(';')?;
+        Ok(reserved)
+    }
+
+    /// Parses past a legacy proto2 group declaration without describing it.
+    ///
+    /// The opening label, name, tag, and balanced body are validated so parsing
+    /// can safely resume at the next supported field. An unclosed group fails.
+    fn skip_group(&mut self) -> Result<()> {
+        self.identifier()?;
+        self.identifier()?;
+        self.expect_symbol('=')?;
+        self.integer()?;
+        self.expect_symbol('{')?;
+        let mut depth = 1usize;
+        while depth != 0 {
+            match self.tokens.get(self.cursor) {
+                Some((Token::Symbol('{'), _)) => depth += 1,
+                Some((Token::Symbol('}'), _)) => depth -= 1,
+                Some(_) => {}
+                None => return Err(Error::new(self.offset(), "unterminated group")),
+            }
+            self.cursor += 1;
+        }
+        self.consume_symbol(';');
+        Ok(())
+    }
+    /// Parses an enum declaration and inserts its descriptor into parser state.
+    ///
+    /// Enum options and reserved declarations are structurally validated.
+    /// Values retain declaration order and signed numeric assignments.
+    fn parse_enum(&mut self, scope: &str) -> Result<()> {
+        self.identifier()?;
+        let name = self.declaration_name()?;
+        let full_name = self.qualify(scope, &name);
+        self.expect_symbol('{')?;
+        let mut values = Vec::new();
+        let mut reserved = ReservedDeclarations::default();
+        let mut allow_alias = false;
+        while !self.consume_symbol('}') {
+            if self.consume_symbol(';') {
+                continue;
+            }
+            if self.peek_identifier(KW_RESERVED) {
+                let declaration = self.parse_reserved(i64::from(i32::MIN), i64::from(i32::MAX))?;
+                reserved.names.extend(declaration.names);
+                reserved.ranges.extend(declaration.ranges);
+                continue;
+            }
+            if self.peek_identifier(KW_OPTION) {
+                let option_start = self.cursor;
+                self.identifier()?;
+                if self.peek_identifier(OPTION_ALLOW_ALIAS) {
+                    self.identifier()?;
+                    self.expect_symbol('=')?;
+                    let value = self.option_value()?;
+                    allow_alias = match value.as_str() {
+                        BOOLEAN_TRUE => true,
+                        BOOLEAN_FALSE => false,
+                        _ => {
+                            return Err(Error::new(
+                                self.offset(),
+                                "allow_alias must be true or false",
+                            ));
+                        }
+                    };
+                    self.expect_symbol(';')?;
+                } else {
+                    self.cursor = option_start;
+                    self.skip_declaration()?;
+                }
+                continue;
+            }
+            let value_name = self.declaration_name()?;
+            self.expect_symbol('=')?;
+            let raw_number = self.integer()?;
+            let number = i32::try_from(raw_number)
+                .map_err(|_| Error::new(self.offset(), "enum value is outside int32 range"))?;
+            if self.consume_symbol('[') {
+                while !self.consume_symbol(']') {
+                    if self.cursor == self.tokens.len() {
+                        return Err(Error::new(self.offset(), "unterminated enum options"));
+                    }
+                    self.cursor += 1
+                }
+            }
+            self.expect_symbol(';')?;
+            values.push(EnumValue {
+                name: value_name,
+                number,
+            })
+        }
+        if values.is_empty() {
+            return Err(Error::new(
+                self.offset(),
+                "enum must declare at least one value",
+            ));
+        }
+        if self.syntax == Syntax::Proto3 && values.first().is_some_and(|value| value.number != 0) {
+            return Err(Error::new(
+                self.offset(),
+                "first proto3 enum value must be zero",
+            ));
+        }
+        validate_reserved_declarations(&reserved, self.offset())?;
+        for (index, value) in values.iter().enumerate() {
+            if values[..index]
+                .iter()
+                .any(|previous| previous.name == value.name)
+            {
+                return Err(Error::new(self.offset(), "duplicate enum value name"));
+            }
+            if !allow_alias
+                && values[..index]
+                    .iter()
+                    .any(|previous| previous.number == value.number)
+            {
+                return Err(Error::new(
+                    self.offset(),
+                    "duplicate enum number requires allow_alias = true",
+                ));
+            }
+            if reserved.names.iter().any(|name| name == &value.name)
+                || reserved
+                    .ranges
+                    .iter()
+                    .any(|(start, end)| (*start..=*end).contains(&i64::from(value.number)))
+            {
+                return Err(Error::new(
+                    self.offset(),
+                    "enum value uses a reserved name or number",
+                ));
+            }
+        }
+        if self.messages.contains_key(&full_name) || self.enums.contains_key(&full_name) {
+            return Err(Error::new(self.offset(), "duplicate protobuf type name"));
+        }
+        self.enums.insert(
+            full_name.clone(),
+            Enum {
+                name,
+                full_name,
+                values,
+            },
+        );
+        Ok(())
+    }
+    /// Parses a message and its nested declarations into descriptor state.
+    ///
+    /// Nested messages and enums recurse with the message's full name as their
+    /// scope. Oneof members receive their shared group name during field parsing.
+    fn parse_message(&mut self, scope: &str) -> Result<()> {
+        self.identifier()?;
+        let name = self.declaration_name()?;
+        let full_name = self.qualify(scope, &name);
+        self.expect_symbol('{')?;
+        let mut fields = Vec::new();
+        let mut oneof_names = Vec::<String>::new();
+        let mut reserved = ReservedDeclarations::default();
+        while !self.consume_symbol('}') {
+            if self.consume_symbol(';') {
+                continue;
+            }
+            if self.peek_identifier(KW_MESSAGE) {
+                self.parse_message(&full_name)?;
+                continue;
+            }
+            if self.peek_identifier(KW_ENUM) {
+                self.parse_enum(&full_name)?;
+                continue;
+            }
+            if self.peek_identifier(KW_ONEOF) {
+                self.identifier()?;
+                let oneof_name = self.declaration_name()?;
+                if oneof_names.contains(&oneof_name) {
+                    return Err(Error::new(self.offset(), "duplicate oneof name"));
+                }
+                oneof_names.push(oneof_name.clone());
+                self.expect_symbol('{')?;
+                while !self.consume_symbol('}') {
+                    if self.consume_symbol(';') {
+                        continue;
+                    }
+                    if self.peek_identifier(KW_OPTION) {
+                        self.skip_declaration()?;
+                        continue;
+                    }
+                    fields.push(self.parse_field(Some(oneof_name.clone()), None)?)
+                }
+                continue;
+            }
+            if self.peek_identifier(KW_RESERVED) {
+                let declaration =
+                    self.parse_reserved(i64::from(MIN_FIELD_NUMBER), i64::from(MAX_FIELD_NUMBER))?;
+                reserved.names.extend(declaration.names);
+                reserved.ranges.extend(declaration.ranges);
+                continue;
+            }
+            if self.peek_identifier(KW_OPTION)
+                || self.peek_identifier(KW_EXTENSIONS)
+                || self.peek_identifier(KW_EXTEND)
+            {
+                self.skip_declaration()?;
+                continue;
+            }
+            let cardinality = if self.peek_identifier(KW_REQUIRED) {
+                self.identifier()?;
+                Some(Cardinality::Required)
+            } else if self.peek_identifier(KW_OPTIONAL) {
+                self.identifier()?;
+                Some(Cardinality::Optional)
+            } else if self.peek_identifier(KW_REPEATED) {
+                self.identifier()?;
+                Some(Cardinality::Repeated)
+            } else {
+                None
+            };
+            if self.peek_identifier(KW_GROUP) {
+                self.skip_group()?;
+                continue;
+            }
+            fields.push(self.parse_field(None, cardinality)?)
+        }
+        validate_message_fields(&fields, &oneof_names, &reserved, self.offset())?;
+        if self.messages.contains_key(&full_name) || self.enums.contains_key(&full_name) {
+            return Err(Error::new(self.offset(), "duplicate protobuf type name"));
+        }
+        self.messages.insert(
+            full_name.clone(),
+            MessageDescriptor {
+                name,
+                full_name,
+                fields,
+            },
+        );
+        Ok(())
+    }
+    /// Parses and validates one ordinary, oneof, or map field declaration.
+    ///
+    /// This enforces legal map key types and field-number ranges, extracts the
+    /// supported `packed` and `default` options, and computes initial presence
+    /// and packing metadata. User-defined types are resolved in a later pass.
+    fn parse_field(
+        &mut self,
+        oneof: Option<String>,
+        declared_cardinality: Option<Cardinality>,
+    ) -> Result<Field> {
+        let is_map = self.peek_identifier(KW_MAP);
+        if self.syntax == Syntax::Proto2
+            && declared_cardinality.is_none()
+            && oneof.is_none()
+            && !is_map
+        {
+            return Err(Error::new(
+                self.offset(),
+                "proto2 field requires a cardinality label",
+            ));
+        }
+        if self.syntax == Syntax::Proto3 && declared_cardinality == Some(Cardinality::Required) {
+            return Err(Error::new(
+                self.offset(),
+                "required fields are not allowed in proto3",
+            ));
+        }
+        if is_map && (declared_cardinality.is_some() || oneof.is_some()) {
+            return Err(Error::new(
+                self.offset(),
+                "map fields cannot have labels or belong to oneof",
+            ));
+        }
+        let kind = if is_map {
+            self.identifier()?;
+            self.expect_symbol('<')?;
+            let key_type = self.parse_type()?;
+            self.expect_symbol(',')?;
+            let value_type = self.parse_type()?;
+            self.expect_symbol('>')?;
+            if !matches!(
+                key_type,
+                FieldType::Int32
+                    | FieldType::Int64
+                    | FieldType::Uint32
+                    | FieldType::Uint64
+                    | FieldType::Sint32
+                    | FieldType::Sint64
+                    | FieldType::Fixed32
+                    | FieldType::Fixed64
+                    | FieldType::Sfixed32
+                    | FieldType::Sfixed64
+                    | FieldType::Bool
+                    | FieldType::String
+            ) {
+                return Err(Error::new(self.offset(), "invalid protobuf map key type"));
+            }
+            FieldType::Map(Box::new(key_type), Box::new(value_type))
+        } else {
+            self.parse_type()?
+        };
+        let name = self.declaration_name()?;
+        self.expect_symbol('=')?;
+        let number = self.integer()?;
+        let valid_range = i64::from(MIN_FIELD_NUMBER)..=i64::from(MAX_FIELD_NUMBER);
+        let reserved_range =
+            i64::from(RESERVED_FIELD_NUMBER_START)..=i64::from(RESERVED_FIELD_NUMBER_END);
+        if !valid_range.contains(&number) || reserved_range.contains(&number) {
+            return Err(Error::new(self.offset(), "invalid field number"));
+        }
+        let mut packed = None;
+        let mut packed_explicit = false;
+        let mut default = None;
+        if self.consume_symbol('[') {
+            loop {
+                if self.consume_symbol(']') {
+                    break;
+                }
+                let option_name = self.identifier()?;
+                self.expect_symbol('=')?;
+                let option_value = self.option_value()?;
+                if option_name == OPTION_PACKED {
+                    if packed.is_some() {
+                        return Err(Error::new(self.offset(), "duplicate packed option"));
+                    }
+                    packed = match option_value.as_str() {
+                        BOOLEAN_TRUE => Some(true),
+                        BOOLEAN_FALSE => Some(false),
+                        _ => {
+                            return Err(Error::new(
+                                self.offset(),
+                                "packed option must be true or false",
+                            ));
+                        }
+                    };
+                    packed_explicit = true;
+                } else if option_name == OPTION_DEFAULT {
+                    if default.is_some() {
+                        return Err(Error::new(self.offset(), "duplicate default option"));
+                    }
+                    default = Some(option_value)
+                }
+                if !self.consume_symbol(']') {
+                    self.expect_symbol(',')?;
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect_symbol(';')?;
+        let cardinality = if matches!(kind, FieldType::Map(..)) {
+            Cardinality::Repeated
+        } else {
+            declared_cardinality.unwrap_or(Cardinality::Optional)
+        };
+        if default.is_some()
+            && (self.syntax == Syntax::Proto3
+                || cardinality == Cardinality::Repeated
+                || oneof.is_some()
+                || matches!(kind, FieldType::Map(..)))
+        {
+            return Err(Error::new(
+                self.offset(),
+                "default option is not valid for this field",
+            ));
+        }
+        if packed.is_some()
+            && (cardinality != Cardinality::Repeated
+                || matches!(
+                    kind,
+                    FieldType::String | FieldType::Bytes | FieldType::Map(..)
+                ))
+        {
+            return Err(Error::new(
+                self.offset(),
+                "packed option requires a repeated primitive field",
+            ));
+        }
+        let explicit_presence = declared_cardinality.is_some() || oneof.is_some();
+        if packed.is_none()
+            && cardinality == Cardinality::Repeated
+            && !matches!(
+                kind,
+                FieldType::String | FieldType::Bytes | FieldType::Map(..)
+            )
+        {
+            packed = Some(self.syntax == Syntax::Proto3);
+        }
+        Ok(Field {
+            name,
+            number: number as u32,
+            cardinality,
+            kind,
+            packed,
+            packed_explicit,
+            oneof,
+            explicit_presence,
+            default,
+        })
+    }
+    /// Parses a built-in scalar type or records a user-defined type for resolution.
+    ///
+    /// Unknown identifiers are intentionally stored as provisional message
+    /// names; [`resolve_schema`] later distinguishes messages from enums using
+    /// all declarations reachable through the registry.
+    fn parse_type(&mut self) -> Result<FieldType> {
+        let name = self.identifier()?;
+        Ok(match name.as_str() {
+            TYPE_DOUBLE => FieldType::Double,
+            TYPE_FLOAT => FieldType::Float,
+            TYPE_INT32 => FieldType::Int32,
+            TYPE_INT64 => FieldType::Int64,
+            TYPE_UINT32 => FieldType::Uint32,
+            TYPE_UINT64 => FieldType::Uint64,
+            TYPE_SINT32 => FieldType::Sint32,
+            TYPE_SINT64 => FieldType::Sint64,
+            TYPE_FIXED32 => FieldType::Fixed32,
+            TYPE_FIXED64 => FieldType::Fixed64,
+            TYPE_SFIXED32 => FieldType::Sfixed32,
+            TYPE_SFIXED64 => FieldType::Sfixed64,
+            TYPE_BOOL => FieldType::Bool,
+            TYPE_STRING => FieldType::String,
+            TYPE_BYTES => FieldType::Bytes,
+            // User-defined names are resolved after every imported file has
+            // been parsed, using protobuf's innermost-scope-first lookup.
+            _ => FieldType::Message(name),
+        })
+    }
+}
+
+/// Rejects duplicate reserved names and overlapping numeric ranges.
+fn validate_reserved_declarations(reserved: &ReservedDeclarations, offset: usize) -> Result<()> {
+    for (index, name) in reserved.names.iter().enumerate() {
+        if reserved
+            .names
+            .iter()
+            .take(index)
+            .any(|previous| previous == name)
+        {
+            return Err(Error::new(offset, "duplicate reserved name"));
+        }
+    }
+    for (index, (start, end)) in reserved.ranges.iter().enumerate() {
+        if reserved
+            .ranges
+            .iter()
+            .take(index)
+            .any(|(previous_start, previous_end)| start <= previous_end && previous_start <= end)
+        {
+            return Err(Error::new(offset, "overlapping reserved ranges"));
+        }
+    }
+    Ok(())
+}
+
+/// Validates field uniqueness, oneof names, and reserved declarations in a message.
+fn validate_message_fields(
+    fields: &[Field],
+    oneof_names: &[String],
+    reserved: &ReservedDeclarations,
+    offset: usize,
+) -> Result<()> {
+    validate_reserved_declarations(reserved, offset)?;
+    for (index, field) in fields.iter().enumerate() {
+        if fields
+            .iter()
+            .take(index)
+            .any(|previous| previous.name == field.name)
+        {
+            return Err(Error::new(offset, "duplicate field name"));
+        }
+        if fields
+            .iter()
+            .take(index)
+            .any(|previous| previous.number == field.number)
+        {
+            return Err(Error::new(offset, "duplicate field number"));
+        }
+        if oneof_names.iter().any(|name| name == &field.name) {
+            return Err(Error::new(offset, "field name conflicts with oneof name"));
+        }
+        if reserved.names.iter().any(|name| name == &field.name)
+            || reserved
+                .ranges
+                .iter()
+                .any(|(start, end)| (*start..=*end).contains(&i64::from(field.number)))
+        {
+            return Err(Error::new(offset, "field uses a reserved name or number"));
+        }
+    }
+    Ok(())
+}
+
+/// Parses one source file without resolving user-defined field types.
+///
+/// The resulting schema retains imports for later registry traversal.
+fn parse_file(source: &str) -> Result<Schema> {
+    validate_pest_syntax(source)?;
+    let mut parser = DescriptorBuilder {
+        tokens: lex(source)?,
+        cursor: 0,
+        syntax: Syntax::Proto2,
+        package: None,
+        messages: BTreeMap::new(),
+        enums: BTreeMap::new(),
+        imports: Vec::new(),
+    };
+    let mut seen_syntax = false;
+    let mut seen_package = false;
+    let mut seen_non_syntax = false;
+    while parser.cursor < parser.tokens.len() {
+        if parser.peek_identifier(KW_SYNTAX) {
+            if seen_syntax || seen_non_syntax {
+                return Err(Error::new(
+                    parser.offset(),
+                    "syntax declaration must occur once at the start of the file",
+                ));
+            }
+            seen_syntax = true;
+            parser.identifier()?;
+            parser.expect_symbol('=')?;
+            let syntax_name = match parser.tokens.get(parser.cursor).cloned() {
+                Some((Token::StringLiteral(value), _)) => {
+                    parser.cursor += 1;
+                    value
+                }
+                _ => return Err(Error::new(parser.offset(), "expected syntax string")),
+            };
+            parser.syntax = match syntax_name.as_str() {
+                SYNTAX_PROTO2 => Syntax::Proto2,
+                SYNTAX_PROTO3 => Syntax::Proto3,
+                _ => return Err(Error::new(parser.offset(), "unsupported syntax")),
+            };
+            parser.expect_symbol(';')?
+        } else if parser.peek_identifier(KW_PACKAGE) {
+            seen_non_syntax = true;
+            if seen_package {
+                return Err(Error::new(parser.offset(), "duplicate package declaration"));
+            }
+            seen_package = true;
+            parser.identifier()?;
+            parser.package = Some(parser.package_name()?);
+            parser.expect_symbol(';')?
+        } else if parser.peek_identifier(KW_IMPORT) {
+            seen_non_syntax = true;
+            parser.identifier()?;
+            let kind = if parser.peek_identifier(KW_PUBLIC) {
+                parser.identifier()?;
+                ImportKind::Public
+            } else if parser.peek_identifier(KW_WEAK) {
+                parser.identifier()?;
+                ImportKind::Weak
+            } else {
+                ImportKind::Normal
+            };
+            let path = match parser.tokens.get(parser.cursor).cloned() {
+                Some((Token::StringLiteral(path), _)) => {
+                    parser.cursor += 1;
+                    path
+                }
+                _ => return Err(Error::new(parser.offset(), "expected import path string")),
+            };
+            parser.expect_symbol(';')?;
+            parser.imports.push(Import { path, kind });
+        } else if parser.peek_identifier(KW_MESSAGE) {
+            seen_non_syntax = true;
+            parser.parse_message("")?
+        } else if parser.peek_identifier(KW_ENUM) {
+            seen_non_syntax = true;
+            parser.parse_enum("")?
+        } else if parser.peek_identifier(KW_OPTION)
+            || parser.peek_identifier(KW_SERVICE)
+            || (parser.peek_identifier(KW_EXTEND) && parser.syntax == Syntax::Proto2)
+        {
+            seen_non_syntax = true;
+            parser.skip_declaration()?
+        } else if parser.consume_symbol(';') {
+            seen_non_syntax = true;
+        } else {
+            return Err(Error::new(
+                parser.offset(),
+                "unexpected top-level declaration",
+            ));
+        }
+    }
+    Ok(Schema {
+        syntax: parser.syntax,
+        package: parser.package,
+        messages: parser.messages,
+        enums: parser.enums,
+        imports: parser.imports,
+    })
+}
+
+/// Parses and resolves one self-contained schema.
+///
+/// Use [`Registry::parse`] when the source contains imports.
+///
+/// # Errors
+///
+/// Returns an error for invalid syntax, invalid field declarations, or
+/// references to message and enum types absent from this source.
+pub fn parse(source: &str) -> Result<Schema> {
+    let mut schema = parse_file(source)?;
+    resolve_schema(&mut schema)?;
+    Ok(schema)
+}
+
+/// Traverses the registered import graph and combines its declarations.
+///
+/// A visited-path collection terminates cycles. Missing weak imports are
+/// ignored, while missing normal/public imports and duplicate symbols fail.
+/// The root source contributes the resulting schema's syntax and package.
+fn parse_registry(root: &str, registry: &Registry) -> Result<Schema> {
+    let mut pending = alloc::vec![root.to_string()];
+    let mut files = BTreeMap::<String, Schema>::new();
+    while let Some(path) = pending.pop() {
+        if files.contains_key(&path) {
+            continue;
+        }
+        let source = registry
+            .source(&path)
+            .ok_or_else(|| Error::new(0, format!("import not found: {path}")))?;
+        let file = parse_file(source)?;
+        for import in &file.imports {
+            if registry.source(&import.path).is_none() {
+                if import.kind == ImportKind::Weak {
+                    continue;
+                }
+                return Err(Error::new(0, format!("import not found: {}", import.path)));
+            }
+            pending.push(import.path.clone());
+        }
+        files.insert(path, file);
+    }
+
+    let paths: Vec<String> = files.keys().cloned().collect();
+    for path in &paths {
+        let file = files
+            .get(path)
+            .ok_or_else(|| Error::new(0, "registered source disappeared"))?;
+        let mut visible_paths = alloc::vec![path.clone()];
+        let mut public_frontier = Vec::<String>::new();
+        for import in &file.imports {
+            if files.contains_key(&import.path) && !visible_paths.contains(&import.path) {
+                visible_paths.push(import.path.clone());
+                public_frontier.push(import.path.clone());
+            }
+        }
+        while let Some(imported_path) = public_frontier.pop() {
+            let imported = files
+                .get(&imported_path)
+                .ok_or_else(|| Error::new(0, "visible import disappeared"))?;
+            for public_import in imported
+                .imports
+                .iter()
+                .filter(|import| import.kind == ImportKind::Public)
+            {
+                if files.contains_key(&public_import.path)
+                    && !visible_paths.contains(&public_import.path)
+                {
+                    visible_paths.push(public_import.path.clone());
+                    public_frontier.push(public_import.path.clone());
+                }
+            }
+        }
+        let mut visible_messages = Vec::<String>::new();
+        let mut visible_enums = Vec::<String>::new();
+        for visible_path in &visible_paths {
+            let visible = files
+                .get(visible_path)
+                .ok_or_else(|| Error::new(0, "visible source disappeared"))?;
+            visible_messages.extend(visible.messages.keys().cloned());
+            visible_enums.extend(visible.enums.keys().cloned());
+        }
+        let file = files
+            .get_mut(path)
+            .ok_or_else(|| Error::new(0, "registered source disappeared"))?;
+        validate_symbol_namespaces(file)?;
+        resolve_schema_with_symbols(file, &visible_messages, &visible_enums)?;
+    }
+
+    let mut schema = files
+        .remove(root)
+        .ok_or_else(|| Error::new(0, "root schema not found"))?;
+    for (_, file) in files {
+        for (name, descriptor) in file.messages {
+            if schema.messages.insert(name.clone(), descriptor).is_some() {
+                return Err(Error::new(0, format!("duplicate message: {name}")));
+            }
+        }
+        for (name, enumeration) in file.enums {
+            if schema.enums.insert(name.clone(), enumeration).is_some() {
+                return Err(Error::new(0, format!("duplicate enum: {name}")));
+            }
+        }
+        schema.imports.extend(file.imports);
+    }
+    validate_symbol_namespaces(&schema)?;
+    Ok(schema)
+}
+
+/// Resolves every deferred user-defined type and computes field presence rules.
+///
+/// Resolution runs after import merging so cross-file names are visible. It
+/// also marks message fields as explicitly present and prevents non-packable
+/// repeated strings, bytes, messages, and maps from using packed encoding.
+fn resolve_schema(schema: &mut Schema) -> Result<()> {
+    validate_symbol_namespaces(schema)?;
+    let messages: Vec<String> = schema.messages.keys().cloned().collect();
+    let enums: Vec<String> = schema.enums.keys().cloned().collect();
+    resolve_schema_with_symbols(schema, &messages, &enums)
+}
+
+/// Resolves fields against the declarations visible from one source file.
+fn resolve_schema_with_symbols(
+    schema: &mut Schema,
+    messages: &[String],
+    enums: &[String],
+) -> Result<()> {
+    for descriptor in schema.messages.values_mut() {
+        for field in &mut descriptor.fields {
+            resolve(&mut field.kind, &descriptor.full_name, messages, enums)?;
+            if field.packed_explicit
+                && field.packed == Some(true)
+                && matches!(
+                    field.kind,
+                    FieldType::String
+                        | FieldType::Bytes
+                        | FieldType::Message(_)
+                        | FieldType::Map(..)
+                )
+            {
+                return Err(Error::new(
+                    0,
+                    format!("field {} cannot use packed encoding", field.name),
+                ));
+            }
+            if field.default.is_some()
+                && matches!(field.kind, FieldType::Message(_) | FieldType::Map(..))
+            {
+                return Err(Error::new(
+                    0,
+                    format!("field {} cannot declare a default", field.name),
+                ));
+            }
+            if matches!(field.kind, FieldType::Message(_)) {
+                field.explicit_presence = true;
+            }
+            if field.cardinality == Cardinality::Repeated
+                && matches!(
+                    field.kind,
+                    FieldType::String
+                        | FieldType::Bytes
+                        | FieldType::Message(_)
+                        | FieldType::Map(..)
+                )
+            {
+                field.packed = Some(false);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates protobuf's shared declaration namespaces before type resolution.
+fn validate_symbol_namespaces(schema: &Schema) -> Result<()> {
+    let mut symbols = BTreeMap::<String, &'static str>::new();
+    for name in schema.messages.keys() {
+        if symbols.insert(name.clone(), "message").is_some() || schema.enums.contains_key(name) {
+            return Err(Error::new(
+                0,
+                format!("conflicting declaration name: {name}"),
+            ));
+        }
+    }
+    for name in schema.enums.keys() {
+        if symbols.insert(name.clone(), "enum").is_some() {
+            return Err(Error::new(
+                0,
+                format!("conflicting declaration name: {name}"),
+            ));
+        }
+    }
+    for descriptor in schema.messages.values() {
+        for field in &descriptor.fields {
+            let name = format!("{}.{}", descriptor.full_name, field.name);
+            if symbols.insert(name.clone(), "field").is_some() {
+                return Err(Error::new(
+                    0,
+                    format!("conflicting declaration name: {name}"),
+                ));
+            }
+        }
+        let mut oneofs = Vec::<&str>::new();
+        for oneof in descriptor
+            .fields
+            .iter()
+            .filter_map(|field| field.oneof.as_deref())
+        {
+            if oneofs.contains(&oneof) {
+                continue;
+            }
+            oneofs.push(oneof);
+            let name = format!("{}.{}", descriptor.full_name, oneof);
+            if symbols.insert(name.clone(), "oneof").is_some() {
+                return Err(Error::new(
+                    0,
+                    format!("conflicting declaration name: {name}"),
+                ));
+            }
+        }
+    }
+    for enumeration in schema.enums.values() {
+        let parent = enumeration
+            .full_name
+            .rsplit_once('.')
+            .map_or("", |(parent, _)| parent);
+        for value in &enumeration.values {
+            let name = if parent.is_empty() {
+                value.name.clone()
+            } else {
+                format!("{parent}.{}", value.name)
+            };
+            if symbols.insert(name.clone(), "enum value").is_some() {
+                return Err(Error::new(
+                    0,
+                    format!("conflicting declaration name: {name}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves one field type using protobuf's innermost-scope-first name lookup.
+///
+/// Absolute names bypass lexical scope. Relative names try the containing
+/// message, each enclosing scope, and finally the unqualified global name.
+/// Map key and value types are resolved recursively.
+fn resolve(t: &mut FieldType, scope: &str, messages: &[String], enums: &[String]) -> Result<()> {
+    match t {
+        FieldType::Message(n) => {
+            let absolute = n.starts_with('.');
+            let raw = n.trim_start_matches('.');
+            let mut candidates = Vec::new();
+            if absolute {
+                candidates.push(raw.to_string());
+            } else {
+                let mut current = scope;
+                loop {
+                    candidates.push(format!("{current}.{raw}"));
+                    if let Some(index) = current.rfind('.') {
+                        current = &current[..index];
+                    } else {
+                        break;
+                    }
+                }
+                candidates.push(raw.to_string());
+            }
+            if let Some(name) = candidates.iter().find(|x| messages.contains(x)) {
+                *n = name.clone();
+            } else if let Some(name) = candidates.iter().find(|x| enums.contains(x)) {
+                *t = FieldType::Enum(name.clone());
+            } else {
+                return Err(Error::new(0, format!("unknown type {n} in {scope}")));
+            }
+        }
+        FieldType::Map(a, b) => {
+            resolve(a, scope, messages, enums)?;
+            resolve(b, scope, messages, enums)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}

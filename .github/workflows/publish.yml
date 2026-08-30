@@ -1,0 +1,89 @@
+name: Publish crate
+
+# Publishing a GitHub Release is the release signal. The first crates.io
+# version must still be uploaded manually before this workflow can be
+# registered as a trusted publisher. Manual dispatch remains a recovery path.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.release.tag_name || github.ref }}
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify package metadata and release tag
+        id: package
+        shell: bash
+        run: |
+          package="$(sed -n 's/^name = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          tag="$(git describe --tags --exact-match HEAD)"
+          [[ "$package" =~ ^[a-zA-Z0-9_-]+$ ]]
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]
+          test "$tag" = "v${version}"
+          if [[ "$GITHUB_EVENT_NAME" = "release" ]]; then
+            test "$tag" = "${{ github.event.release.tag_name }}"
+          fi
+          echo "name=$package" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether this version is already published
+        id: existing
+        shell: bash
+        env:
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          status="$(curl \
+            --silent \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            "https://crates.io/api/v1/crates/${PACKAGE_NAME}/${PACKAGE_VERSION}")"
+          case "$status" in
+            200) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "crates.io returned HTTP $status" >&2; exit 1 ;;
+          esac
+
+      - name: Verify the crates.io package
+        if: steps.existing.outputs.exists != 'true'
+        run: cargo publish --dry-run
+
+      - name: Authenticate with crates.io
+        if: steps.existing.outputs.exists != 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish package
+        if: steps.existing.outputs.exists != 'true'
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Report an existing release
+        if: steps.existing.outputs.exists == 'true'
+        run: >-
+          echo "${{ steps.package.outputs.name }}
+          ${{ steps.package.outputs.version }} is already published; nothing to do."
