@@ -1,8 +1,8 @@
 # proto-rs
 
 [![CI](https://github.com/jblestang/proto-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/jblestang/proto-rs/actions/workflows/ci.yml)
-[![Crates.io](https://img.shields.io/crates/v/proto-rs-dynamic.svg)](https://crates.io/crates/proto-rs-dynamic)
-[![Documentation](https://docs.rs/proto-rs-dynamic/badge.svg)](https://docs.rs/proto-rs-dynamic)
+[![crates.io](https://img.shields.io/crates/v/proto-rs-dynamic?logo=rust)](https://crates.io/crates/proto-rs-dynamic)
+[![docs.rs](https://img.shields.io/docsrs/proto-rs-dynamic?logo=docs.rs)](https://docs.rs/proto-rs-dynamic)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 > **Development disclosure:** This project has been vibe-coded with OpenAI
