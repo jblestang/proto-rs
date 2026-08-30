@@ -1,0 +1,4 @@
+# Report only Rust source files in GitHub's repository language statistics.
+# The bundled C++ and .proto files belong to the upstream conformance fixture.
+* linguist-detectable=false
+*.rs linguist-detectable=true
