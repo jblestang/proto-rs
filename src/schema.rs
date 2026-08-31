@@ -317,17 +317,19 @@
 use crate::{
     Error, Result,
     constants::{
-        BOOLEAN_FALSE, BOOLEAN_TRUE, CUSTOM_OPTION_MIN_FIELD_NUMBER, EDITION_2023,
-        FEATURE_ENUM_TYPE, FEATURE_FIELD_PRESENCE, FEATURE_JSON_FORMAT, FEATURE_MESSAGE_ENCODING,
-        FEATURE_REPEATED_ENCODING, FEATURE_UTF8_VALIDATION, KW_EDITION, KW_ENUM, KW_EXTEND,
-        KW_EXTENSIONS, KW_GROUP, KW_IMPORT, KW_MAP, KW_MAX, KW_MESSAGE, KW_ONEOF, KW_OPTION,
-        KW_OPTIONAL, KW_PACKAGE, KW_PUBLIC, KW_REPEATED, KW_REQUIRED, KW_RESERVED, KW_RETURNS,
-        KW_RPC, KW_SERVICE, KW_STREAM, KW_SYNTAX, KW_TO, KW_WEAK, LONG_UNICODE_ESCAPE_DIGITS,
-        MAX_FIELD_NUMBER, MIN_FIELD_NUMBER, OPTION_ALLOW_ALIAS, OPTION_DEFAULT, OPTION_PACKED,
-        RESERVED_FIELD_NUMBER_END, RESERVED_FIELD_NUMBER_START, SHORT_UNICODE_ESCAPE_DIGITS,
-        SYNTAX_PROTO2, SYNTAX_PROTO3, TYPE_BOOL, TYPE_BYTES, TYPE_DOUBLE, TYPE_FIXED32,
-        TYPE_FIXED64, TYPE_FLOAT, TYPE_INT32, TYPE_INT64, TYPE_SFIXED32, TYPE_SFIXED64,
-        TYPE_SINT32, TYPE_SINT64, TYPE_STRING, TYPE_UINT32, TYPE_UINT64,
+        BOOLEAN_FALSE, BOOLEAN_TRUE, CUSTOM_OPTION_MIN_FIELD_NUMBER, DEFAULT_RECURSION_LIMIT,
+        EDITION_2023, FEATURE_ENUM_TYPE, FEATURE_FIELD_PRESENCE, FEATURE_JSON_FORMAT,
+        FEATURE_MESSAGE_ENCODING, FEATURE_REPEATED_ENCODING, FEATURE_UTF8_VALIDATION,
+        HARDENED_SCHEMA_MAX_NESTING_DEPTH, HARDENED_SCHEMA_MAX_REGISTRY_FILES,
+        HARDENED_SCHEMA_MAX_SOURCE_BYTES, HARDENED_SCHEMA_MAX_TOKENS, KW_EDITION, KW_ENUM,
+        KW_EXTEND, KW_EXTENSIONS, KW_GROUP, KW_IMPORT, KW_MAP, KW_MAX, KW_MESSAGE, KW_ONEOF,
+        KW_OPTION, KW_OPTIONAL, KW_PACKAGE, KW_PUBLIC, KW_REPEATED, KW_REQUIRED, KW_RESERVED,
+        KW_RETURNS, KW_RPC, KW_SERVICE, KW_STREAM, KW_SYNTAX, KW_TO, KW_WEAK,
+        LONG_UNICODE_ESCAPE_DIGITS, MAX_FIELD_NUMBER, MIN_FIELD_NUMBER, OPTION_ALLOW_ALIAS,
+        OPTION_DEFAULT, OPTION_PACKED, RESERVED_FIELD_NUMBER_END, RESERVED_FIELD_NUMBER_START,
+        SHORT_UNICODE_ESCAPE_DIGITS, SYNTAX_PROTO2, SYNTAX_PROTO3, TYPE_BOOL, TYPE_BYTES,
+        TYPE_DOUBLE, TYPE_FIXED32, TYPE_FIXED64, TYPE_FLOAT, TYPE_INT32, TYPE_INT64, TYPE_SFIXED32,
+        TYPE_SFIXED64, TYPE_SINT32, TYPE_SINT64, TYPE_STRING, TYPE_UINT32, TYPE_UINT64,
     },
 };
 use alloc::{
@@ -757,6 +759,42 @@ pub struct Registry {
     sources: BTreeMap<String, String>,
 }
 
+/// Resource limits for parsing `.proto` sources and registry import graphs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchemaParseOptions {
+    /// Maximum bytes accepted in any one registered source.
+    pub max_source_bytes: usize,
+    /// Maximum lexical tokens retained for any one source.
+    pub max_tokens: usize,
+    /// Maximum brace nesting accepted before invoking the grammar parser.
+    pub max_nesting_depth: usize,
+    /// Maximum number of reachable sources in one registry parse.
+    pub max_registry_files: usize,
+}
+
+impl Default for SchemaParseOptions {
+    fn default() -> Self {
+        Self {
+            max_source_bytes: usize::MAX,
+            max_tokens: usize::MAX,
+            max_nesting_depth: DEFAULT_RECURSION_LIMIT,
+            max_registry_files: usize::MAX,
+        }
+    }
+}
+
+impl SchemaParseOptions {
+    /// Returns finite limits suitable for registries supplied by untrusted peers.
+    pub const fn hardened() -> Self {
+        Self {
+            max_source_bytes: HARDENED_SCHEMA_MAX_SOURCE_BYTES,
+            max_tokens: HARDENED_SCHEMA_MAX_TOKENS,
+            max_nesting_depth: HARDENED_SCHEMA_MAX_NESTING_DEPTH,
+            max_registry_files: HARDENED_SCHEMA_MAX_REGISTRY_FILES,
+        }
+    }
+}
+
 impl Registry {
     /// Creates an empty schema registry.
     pub const fn new() -> Self {
@@ -792,7 +830,12 @@ impl Registry {
     /// Returns an error when a required source is absent, a source is invalid,
     /// imported declarations conflict, or a referenced type cannot be resolved.
     pub fn parse(&self, root: &str) -> Result<Schema> {
-        parse_registry(root, self)
+        self.parse_with_options(root, &SchemaParseOptions::default())
+    }
+
+    /// Parses a root and its imports under explicit resource limits.
+    pub fn parse_with_options(&self, root: &str, options: &SchemaParseOptions) -> Result<Schema> {
+        parse_registry(root, self, options)
     }
 
     /// Reports how many source files are currently registered.
@@ -2717,10 +2760,70 @@ fn validate_message_fields(
 /// Parses one source file without resolving user-defined field types.
 ///
 /// The resulting schema retains imports for later registry traversal.
-fn parse_file(source: &str) -> Result<Schema> {
+fn validate_source_resource_limits(source: &str, options: &SchemaParseOptions) -> Result<()> {
+    if source.len() > options.max_source_bytes {
+        return Err(Error::new(0, "schema source exceeds configured size limit"));
+    }
+    let bytes = source.as_bytes();
+    let mut cursor = 0usize;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        let next = bytes.get(cursor + 1).copied();
+        if line_comment {
+            line_comment = byte != b'\n';
+        } else if block_comment {
+            if byte == b'*' && next == Some(b'/') {
+                block_comment = false;
+                cursor += 1;
+            }
+        } else if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+        } else if byte == b'/' && next == Some(b'/') {
+            line_comment = true;
+            cursor += 1;
+        } else if byte == b'/' && next == Some(b'*') {
+            block_comment = true;
+            cursor += 1;
+        } else if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+        } else if byte == b'{' {
+            depth = depth
+                .checked_add(1)
+                .ok_or_else(|| Error::new(cursor, "schema nesting counter overflow"))?;
+            if depth > options.max_nesting_depth {
+                return Err(Error::new(
+                    cursor,
+                    "schema exceeds configured nesting limit",
+                ));
+            }
+        } else if byte == b'}' {
+            depth = depth.saturating_sub(1);
+        }
+        cursor += 1;
+    }
+    Ok(())
+}
+
+fn parse_file(source: &str, options: &SchemaParseOptions) -> Result<Schema> {
+    validate_source_resource_limits(source, options)?;
     validate_pest_syntax(source)?;
+    let tokens = lex(source)?;
+    if tokens.len() > options.max_tokens {
+        return Err(Error::new(0, "schema exceeds configured token limit"));
+    }
     let mut parser = DescriptorBuilder {
-        tokens: lex(source)?,
+        tokens,
         cursor: 0,
         syntax: Syntax::Proto2,
         package: None,
@@ -2844,7 +2947,12 @@ fn parse_file(source: &str) -> Result<Schema> {
 /// Returns an error for invalid syntax, invalid field declarations, or
 /// references to message and enum types absent from this source.
 pub fn parse(source: &str) -> Result<Schema> {
-    let mut schema = parse_file(source)?;
+    parse_with_options(source, &SchemaParseOptions::default())
+}
+
+/// Parses and resolves one source under explicit resource limits.
+pub fn parse_with_options(source: &str, options: &SchemaParseOptions) -> Result<Schema> {
+    let mut schema = parse_file(source, options)?;
     resolve_schema(&mut schema)?;
     Ok(schema)
 }
@@ -2854,7 +2962,7 @@ pub fn parse(source: &str) -> Result<Schema> {
 /// A visited-path collection terminates cycles. Missing weak imports are
 /// ignored, while missing normal/public imports and duplicate symbols fail.
 /// The root source contributes the resulting schema's syntax and package.
-fn parse_registry(root: &str, registry: &Registry) -> Result<Schema> {
+fn parse_registry(root: &str, registry: &Registry, options: &SchemaParseOptions) -> Result<Schema> {
     let mut pending = alloc::vec![root.to_string()];
     let mut files = BTreeMap::<String, Schema>::new();
     while let Some(path) = pending.pop() {
@@ -2864,7 +2972,10 @@ fn parse_registry(root: &str, registry: &Registry) -> Result<Schema> {
         let source = registry
             .source(&path)
             .ok_or_else(|| Error::new(0, format!("import not found: {path}")))?;
-        let file = parse_file(source).map_err(|error| {
+        if files.len() >= options.max_registry_files {
+            return Err(Error::new(0, "registry exceeds configured file limit"));
+        }
+        let file = parse_file(source, options).map_err(|error| {
             Error::new(
                 error.offset,
                 format!("while parsing registry source {path}: {}", error.message),

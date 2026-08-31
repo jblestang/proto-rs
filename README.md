@@ -29,6 +29,8 @@ does not require generated Rust types: messages are represented by generic
 - Every scalar protobuf wire type and embedded messages
 - Unknown-field preservation across decode/encode
 - Field-number and malformed-wire validation
+- Finite hardened profiles for binary, protobuf JSON, and untrusted Registry
+  inputs
 - Checked-in Pest grammar for complete syntax validation
 - Unconditional `#![no_std]`; Pest dependencies have their `std` features off
 

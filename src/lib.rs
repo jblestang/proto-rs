@@ -127,7 +127,8 @@ pub use schema::{
     Cardinality, CustomOptionDescriptor, Enum, EnumType, EnumValue, ExtensionDescriptor,
     FeatureSet, Field, FieldPresence, FieldType, Import, ImportKind, JsonFormat, MessageDescriptor,
     MessageEncoding, MethodDescriptor, OneofDescriptor, OptionSetting, OptionValueKind, Registry,
-    RepeatedFieldEncoding, Schema, ServiceDescriptor, Syntax, Utf8Validation, parse,
+    RepeatedFieldEncoding, Schema, SchemaParseOptions, ServiceDescriptor, Syntax, Utf8Validation,
+    parse, parse_with_options,
 };
 /// Error returned when schema or wire data cannot be processed safely.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1562,5 +1563,187 @@ mod tests {
                message Valid { legacy.Data data = 1; }"#,
         );
         assert!(registry.parse("root.proto").is_ok());
+    }
+
+    /// Public raw fields cannot smuggle additional wire occurrences.
+    #[test]
+    fn encoder_rejects_malformed_or_trailing_raw_field_data() {
+        let schema = parse(r#"syntax="proto3"; message Packet {}"#).unwrap();
+        let packet = schema.message("Packet").unwrap();
+        let mut message = Message::new();
+        message.add_field(AddedField {
+            name: "external".into(),
+            number: 1,
+            wire_type: constants::WIRE_TYPE_VARINT,
+            encoded_value: vec![1, 0x10, 1],
+        });
+        assert!(encode(&schema, packet, &message).is_err());
+
+        message.added_fields[0].encoded_value = vec![constants::VARINT_CONTINUATION_BIT];
+        assert!(encode(&schema, packet, &message).is_err());
+
+        let mut replay = Message::new();
+        replay.audit.push(AuditRecord {
+            tag: AuditTag::DuplicateDiscarded,
+            field_name: None,
+            field_number: 1,
+            wire_type: constants::WIRE_TYPE_VARINT,
+            encoded_field: vec![0x08, 1, 0x10, 1],
+        });
+        let options = EncodeOptions {
+            duplicates: DuplicatePolicy::PreserveAll,
+            ..EncodeOptions::default()
+        };
+        assert!(encode_with_options(&schema, packet, &replay, &options).is_err());
+    }
+
+    /// Dynamic values must obey repeated, singular, oneof, and map invariants.
+    #[test]
+    fn encoder_rejects_semantically_inconsistent_dynamic_messages() {
+        let schema = parse(
+            r#"syntax="proto3";
+               message Packet {
+                 int32 singular = 1;
+                 repeated int32 many = 2;
+                 oneof choice { int32 left = 3; int32 right = 4; }
+                 map<string, int32> lookup = 5;
+               }"#,
+        )
+        .unwrap();
+        let packet = schema.message("Packet").unwrap();
+
+        let mut singular = Message::new();
+        singular.insert("singular", Value::Repeated(vec![Value::Int32(1)]));
+        assert!(encode(&schema, packet, &singular).is_err());
+
+        let mut repeated = Message::new();
+        repeated.insert("many", Value::Int32(1));
+        assert!(encode(&schema, packet, &repeated).is_err());
+
+        let mut oneof = Message::new();
+        oneof.insert("left", Value::Int32(1));
+        oneof.insert("right", Value::Int32(2));
+        assert!(encode(&schema, packet, &oneof).is_err());
+
+        let mut map = Message::new();
+        map.insert(
+            "lookup",
+            Value::Map(vec![
+                (Value::String("key".into()), Value::Int32(1)),
+                (Value::String("key".into()), Value::Int32(2)),
+            ]),
+        );
+        assert!(encode(&schema, packet, &map).is_err());
+    }
+
+    /// Closed enum descriptors reject programmatically supplied unknown values.
+    #[test]
+    fn encoder_rejects_unknown_closed_enum_values() {
+        let schema = parse(
+            r#"syntax="proto2"; enum State { ZERO = 0; } message Packet { optional State state = 1; }"#,
+        )
+        .unwrap();
+        let packet = schema.message("Packet").unwrap();
+        let mut message = Message::new();
+        message.insert("state", Value::Enum(7));
+        assert!(encode(&schema, packet, &message).is_err());
+    }
+
+    /// Output budgets are enforced before copying a large length-delimited value.
+    #[test]
+    fn encoder_preflights_large_output_appends() {
+        let schema = parse(r#"syntax="proto3"; message Packet { bytes data = 1; }"#).unwrap();
+        let packet = schema.message("Packet").unwrap();
+        let mut message = Message::new();
+        message.insert("data", Value::Bytes(vec![0; 1024]));
+        let options = EncodeOptions {
+            max_output_bytes: 32,
+            ..EncodeOptions::default()
+        };
+        assert!(encode_with_options(&schema, packet, &message, &options).is_err());
+    }
+
+    /// JSON limits stop deeply nested input before semantic traversal.
+    #[test]
+    fn json_hardened_profile_bounds_nesting_and_input_size() {
+        let schema = parse(r#"syntax="proto3"; message Packet {}"#).unwrap();
+        let packet = schema.message("Packet").unwrap();
+        let options = JsonDecodeOptions {
+            max_nesting_depth: 2,
+            max_input_bytes: 32,
+            ..JsonDecodeOptions::hardened()
+        };
+        assert!(
+            decode_json_with_options(&schema, packet, r#"{"a":{"b":{"c":0}}}"#, &options).is_err()
+        );
+        assert!(decode_json_with_options(&schema, packet, &" ".repeat(33), &options).is_err());
+    }
+
+    /// JSON integer conversion rejects values just beyond 64-bit boundaries.
+    #[test]
+    fn json_rejects_rounded_64_bit_integer_overflow() {
+        let schema =
+            parse(r#"syntax="proto3"; message Packet { int64 signed = 1; uint64 unsigned = 2; }"#)
+                .unwrap();
+        let packet = schema.message("Packet").unwrap();
+        assert!(decode_json(&schema, packet, r#"{"signed":9.223372036854776e18}"#).is_err());
+        assert!(decode_json(&schema, packet, r#"{"unsigned":1.8446744073709552e19}"#).is_err());
+        assert!(decode_json(&schema, packet, r#"{"signed":"1.5e1"}"#).is_ok());
+    }
+
+    /// Bytes JSON rejects invalid padding and data following the padding.
+    #[test]
+    fn json_rejects_noncanonical_base64() {
+        let schema = parse(r#"syntax="proto3"; message Packet { bytes data = 1; }"#).unwrap();
+        let packet = schema.message("Packet").unwrap();
+        assert!(decode_json(&schema, packet, r#"{"data":"Zg==junk"}"#).is_err());
+        assert!(decode_json(&schema, packet, r#"{"data":"Zh=="}"#).is_ok());
+        assert!(decode_json(&schema, packet, r#"{"data":"Zg=="}"#).is_ok());
+        assert!(decode_json(&schema, packet, r#"{"data":"Zg"}"#).is_ok());
+    }
+
+    /// Proto-name and jsonName spellings still denote one logical occurrence.
+    #[test]
+    fn json_rejects_duplicate_field_aliases_after_implicit_default() {
+        let schema = parse(r#"syntax="proto3"; message Packet { int32 foo_bar = 1; }"#).unwrap();
+        let packet = schema.message("Packet").unwrap();
+        assert!(decode_json(&schema, packet, r#"{"foo_bar":0,"fooBar":1}"#).is_err());
+    }
+
+    /// Timestamp JSON accepts only normalized seconds from zero through 59.
+    #[test]
+    fn json_rejects_leap_second_timestamp_spelling() {
+        let schema = parse(
+            r#"syntax="proto3"; package google.protobuf;
+               message Timestamp { int64 seconds = 1; int32 nanos = 2; }"#,
+        )
+        .unwrap();
+        let timestamp = schema.message("google.protobuf.Timestamp").unwrap();
+        assert!(decode_json(&schema, timestamp, r#""2016-12-31T23:59:60Z""#).is_err());
+    }
+
+    /// Schema parsing exposes finite source, nesting, token, and graph limits.
+    #[test]
+    fn hardened_schema_options_bound_untrusted_registries() {
+        let options = SchemaParseOptions {
+            max_source_bytes: 32,
+            ..SchemaParseOptions::hardened()
+        };
+        assert!(parse_with_options(&" ".repeat(33), &options).is_err());
+
+        let options = SchemaParseOptions {
+            max_nesting_depth: 1,
+            ..SchemaParseOptions::hardened()
+        };
+        assert!(parse_with_options(r#"message A { message B {} }"#, &options).is_err());
+
+        let mut registry = Registry::new();
+        registry.register("root.proto", r#"import "child.proto"; message Root {}"#);
+        registry.register("child.proto", "message Child {}");
+        let options = SchemaParseOptions {
+            max_registry_files: 1,
+            ..SchemaParseOptions::hardened()
+        };
+        assert!(registry.parse_with_options("root.proto", &options).is_err());
     }
 }

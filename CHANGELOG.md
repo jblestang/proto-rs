@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-31
+
+### Fixed
+
+- Hardened raw-field and duplicate replay validation against trailing wire
+  injection, and enforced dynamic cardinality, oneof, map, and closed-enum
+  invariants during encoding.
+- Added pre-append output budgeting and finite hardened profiles for binary,
+  protobuf JSON, and Registry schema parsing.
+- Made protobuf JSON integer conversion exact and bounded its recursion and
+  allocations; tightened duplicate aliases, base64, and Timestamp validation.
+
 ## [0.2.1] - 2026-08-31
 
 ### Fixed
@@ -58,7 +70,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Official protobuf conformance harness, unit tests, benchmarks, and a
   coverage-guided decoder fuzz target.
 
-[Unreleased]: https://github.com/jblestang/proto-rs/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/jblestang/proto-rs/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/jblestang/proto-rs/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/jblestang/proto-rs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jblestang/proto-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jblestang/proto-rs/releases/tag/v0.1.0

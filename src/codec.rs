@@ -327,16 +327,18 @@ use crate::{
     MessageEncoding, Result, Schema, Utf8Validation,
     constants::{
         CANONICAL_F32_NAN_BITS, CANONICAL_F64_NAN_BITS, DEFAULT_RECURSION_LIMIT,
-        FIELD_NUMBER_SHIFT, FIXED32_SIZE, FIXED64_SIZE, I32_SIGN_SHIFT, I64_SIGN_SHIFT,
-        MAP_KEY_FIELD_NUMBER, MAP_VALUE_FIELD_NUMBER, MAX_FIELD_KEY_BYTES, MAX_FIELD_NUMBER,
-        MAX_TENTH_VARINT_BYTE, MAX_VARINT_BYTES, MIN_FIELD_NUMBER, VARINT_BITS_PER_BYTE,
-        VARINT_CONTINUATION_BIT, VARINT_DATA_MASK, WIRE_TYPE_END_GROUP, WIRE_TYPE_FIXED32,
-        WIRE_TYPE_FIXED64, WIRE_TYPE_LENGTH_DELIMITED, WIRE_TYPE_MASK, WIRE_TYPE_START_GROUP,
-        WIRE_TYPE_VARINT, is_supported_wire_type, make_key,
+        FIELD_NUMBER_SHIFT, FIXED32_SIZE, FIXED64_SIZE, HARDENED_MAX_AUDIT_BYTES,
+        HARDENED_MAX_FIELD_OCCURRENCES, HARDENED_MAX_LENGTH_DELIMITED_BYTES,
+        HARDENED_MAX_MAP_ENTRIES, HARDENED_MAX_MESSAGE_BYTES, HARDENED_MAX_REPEATED_VALUES,
+        I32_SIGN_SHIFT, I64_SIGN_SHIFT, MAP_KEY_FIELD_NUMBER, MAP_VALUE_FIELD_NUMBER,
+        MAX_FIELD_KEY_BYTES, MAX_FIELD_NUMBER, MAX_TENTH_VARINT_BYTE, MAX_VARINT_BYTES,
+        MIN_FIELD_NUMBER, VARINT_BITS_PER_BYTE, VARINT_CONTINUATION_BIT, VARINT_DATA_MASK,
+        WIRE_TYPE_END_GROUP, WIRE_TYPE_FIXED32, WIRE_TYPE_FIXED64, WIRE_TYPE_LENGTH_DELIMITED,
+        WIRE_TYPE_MASK, WIRE_TYPE_START_GROUP, WIRE_TYPE_VARINT, is_supported_wire_type, make_key,
     },
 };
 use alloc::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     string::{String, ToString},
     vec::Vec,
 };
@@ -514,6 +516,27 @@ impl Default for DecodeOptions {
             require_minimal_varints: false,
             booleans: BooleanValuePolicy::CoerceNonzero,
             enum_values: EnumValuePolicy::Preserve,
+        }
+    }
+}
+
+impl DecodeOptions {
+    /// Returns finite, strict defaults suitable for decoding hostile traffic.
+    pub const fn hardened() -> Self {
+        Self {
+            max_message_bytes: HARDENED_MAX_MESSAGE_BYTES,
+            max_recursion_depth: DEFAULT_RECURSION_LIMIT,
+            max_field_occurrences: HARDENED_MAX_FIELD_OCCURRENCES,
+            max_length_delimited_bytes: HARDENED_MAX_LENGTH_DELIMITED_BYTES,
+            max_repeated_values: HARDENED_MAX_REPEATED_VALUES,
+            max_map_entries: HARDENED_MAX_MAP_ENTRIES,
+            max_audit_bytes: HARDENED_MAX_AUDIT_BYTES,
+            unknown_fields: UnknownFieldPolicy::Reject,
+            duplicates: DuplicateInputPolicy::Reject,
+            audit_mode: AuditMode::MetadataOnly,
+            require_minimal_varints: true,
+            booleans: BooleanValuePolicy::RejectNonCanonical,
+            enum_values: EnumValuePolicy::RejectUnknown,
         }
     }
 }
@@ -787,12 +810,35 @@ fn scalar(
         (FieldType::Sfixed32, Value::Int32(x)) => o.extend(x.to_le_bytes()),
         (FieldType::Sfixed64, Value::Int64(x)) => o.extend(x.to_le_bytes()),
         (FieldType::Bool, Value::Bool(x)) => vi(*x as u64, o),
-        (FieldType::Enum(_), Value::Enum(x)) => vi(*x as i64 as u64, o),
+        (FieldType::Enum(name), Value::Enum(x)) => {
+            if s.enums.get(name).is_some_and(|enumeration| {
+                enumeration.features.enum_type == EnumType::Closed
+                    && !enumeration
+                        .values
+                        .iter()
+                        .any(|candidate| candidate.number == *x)
+            }) {
+                return Err(Error::new(0, "unknown value for closed enum"));
+            }
+            vi(*x as i64 as u64, o);
+        }
         (FieldType::String, Value::String(x)) => {
+            ensure_output_growth(
+                o.len(),
+                minimal_varint_length(x.len() as u64),
+                x.len(),
+                options.max_output_bytes,
+            )?;
             vi(x.len() as u64, o);
             o.extend(x.as_bytes())
         }
         (FieldType::Bytes, Value::Bytes(x)) => {
+            ensure_output_growth(
+                o.len(),
+                minimal_varint_length(x.len() as u64),
+                x.len(),
+                options.max_output_bytes,
+            )?;
             vi(x.len() as u64, o);
             o.extend(x)
         }
@@ -801,10 +847,36 @@ fn scalar(
                 .message(n)
                 .ok_or_else(|| Error::new(0, "unknown message type"))?;
             let b = encode_inner(s, d, x, options)?.bytes;
+            ensure_output_growth(
+                o.len(),
+                minimal_varint_length(b.len() as u64),
+                b.len(),
+                options.max_output_bytes,
+            )?;
             vi(b.len() as u64, o);
             o.extend(b)
         }
         _ => return Err(Error::new(0, "value does not match field type")),
+    }
+    Ok(())
+}
+
+/// Rejects an append before it can grow an output buffer beyond its budget.
+fn ensure_output_growth(
+    current: usize,
+    overhead: usize,
+    payload: usize,
+    limit: usize,
+) -> Result<()> {
+    let required = current
+        .checked_add(overhead)
+        .and_then(|value| value.checked_add(payload))
+        .ok_or_else(|| Error::new(0, "encoded message size overflow"))?;
+    if required > limit {
+        return Err(Error::new(
+            0,
+            "encoded message exceeds configured size limit",
+        ));
     }
     Ok(())
 }
@@ -892,6 +964,81 @@ pub fn encode_with_options(
     encode_inner(s, d, m, options)
 }
 
+/// Validates descriptor-level invariants that the open dynamic model cannot
+/// express in its Rust types alone.
+fn validate_message_shape(s: &Schema, d: &MessageDescriptor, m: &Message) -> Result<()> {
+    let mut selected_oneofs = BTreeSet::new();
+    for field in s.fields_for(d) {
+        let Some(value) = m.get(&field.name) else {
+            continue;
+        };
+        if let Some(oneof) = &field.oneof
+            && !selected_oneofs.insert(oneof.as_str())
+        {
+            return Err(Error::new(0, "multiple values supplied for oneof"));
+        }
+        match (&field.kind, field.cardinality, value) {
+            (FieldType::Map(_, _), _, Value::Map(entries)) => {
+                for (index, (key, _)) in entries.iter().enumerate() {
+                    if entries[..index].iter().any(|(previous, _)| previous == key) {
+                        return Err(Error::new(0, "dynamic map contains duplicate keys"));
+                    }
+                }
+            }
+            (FieldType::Map(_, _), _, _) => {
+                return Err(Error::new(0, "map field requires Value::Map"));
+            }
+            (_, Cardinality::Repeated, Value::Repeated(_)) => {}
+            (_, Cardinality::Repeated, _) => {
+                return Err(Error::new(0, "repeated field requires Value::Repeated"));
+            }
+            (_, _, Value::Repeated(_)) => {
+                return Err(Error::new(
+                    0,
+                    "singular field cannot contain Value::Repeated",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Requires a public raw-field buffer to contain exactly one complete value.
+fn validate_raw_field(number: u32, wire_type: u8, encoded_value: &[u8]) -> Result<()> {
+    if !(MIN_FIELD_NUMBER..=MAX_FIELD_NUMBER).contains(&number)
+        || !is_supported_wire_type(wire_type)
+    {
+        return Err(Error::new(0, "raw field has invalid wire metadata"));
+    }
+    let mut cursor = 0;
+    skip(number, wire_type, encoded_value, &mut cursor)?;
+    if cursor != encoded_value.len() {
+        return Err(Error::new(cursor, "raw field contains trailing wire data"));
+    }
+    Ok(())
+}
+
+/// Validates a complete audit occurrence before duplicate replay.
+fn validate_encoded_occurrence(record: &AuditRecord) -> Result<()> {
+    let mut cursor = 0;
+    let (number, wire_type) = read_key(&record.encoded_field, &mut cursor)?;
+    if number != record.field_number || wire_type != record.wire_type {
+        return Err(Error::new(
+            0,
+            "audit wire metadata does not match encoded field",
+        ));
+    }
+    skip(number, wire_type, &record.encoded_field, &mut cursor)?;
+    if cursor != record.encoded_field.len() {
+        return Err(Error::new(
+            cursor,
+            "audit field contains trailing wire data",
+        ));
+    }
+    Ok(())
+}
+
 /// Implements recursive serialization shared by the public encoding APIs.
 fn encode_inner(
     s: &Schema,
@@ -899,6 +1046,7 @@ fn encode_inner(
     m: &Message,
     options: &EncodeOptions,
 ) -> Result<EncodeOutput> {
+    validate_message_shape(s, d, m)?;
     let mut o = Vec::new();
     let mut audit = m.audit.clone();
     if options.duplicates == DuplicatePolicy::PreserveAll {
@@ -910,6 +1058,13 @@ fn encode_inner(
                         "cannot preserve duplicate without retained audit bytes",
                     ));
                 }
+                validate_encoded_occurrence(record)?;
+                ensure_output_growth(
+                    o.len(),
+                    0,
+                    record.encoded_field.len(),
+                    options.max_output_bytes,
+                )?;
                 o.extend_from_slice(&record.encoded_field);
             }
         }
@@ -934,6 +1089,13 @@ fn encode_inner(
                         &mut entry,
                     );
                     scalar(value_type, value, s, options, &mut entry)?;
+                    ensure_output_growth(
+                        o.len(),
+                        minimal_varint_length(make_key(f.number, WIRE_TYPE_LENGTH_DELIMITED))
+                            + minimal_varint_length(entry.len() as u64),
+                        entry.len(),
+                        options.max_output_bytes,
+                    )?;
                     vi(make_key(f.number, WIRE_TYPE_LENGTH_DELIMITED), &mut o);
                     vi(entry.len() as u64, &mut o);
                     o.extend(entry);
@@ -957,6 +1119,13 @@ fn encode_inner(
                 for x in xs {
                     scalar(&f.kind, x, s, options, &mut z)?
                 }
+                ensure_output_growth(
+                    o.len(),
+                    minimal_varint_length(make_key(f.number, WIRE_TYPE_LENGTH_DELIMITED))
+                        + minimal_varint_length(z.len() as u64),
+                    z.len(),
+                    options.max_output_bytes,
+                )?;
                 vi(make_key(f.number, WIRE_TYPE_LENGTH_DELIMITED), &mut o);
                 vi(z.len() as u64, &mut o);
                 o.extend(z)
@@ -984,6 +1153,12 @@ fn encode_inner(
                                     "raw string requires utf8_validation = NONE",
                                 ));
                             }
+                            ensure_output_growth(
+                                o.len(),
+                                minimal_varint_length(bytes.len() as u64),
+                                bytes.len(),
+                                options.max_output_bytes,
+                            )?;
                             vi(bytes.len() as u64, &mut o);
                             o.extend(bytes);
                         } else {
@@ -1008,17 +1183,26 @@ fn encode_inner(
             options.forward_unknown_fields
         };
         if forward {
+            validate_raw_field(u.number, u.wire_type, &u.encoded_value)?;
+            ensure_output_growth(
+                o.len(),
+                minimal_varint_length(make_key(u.number, u.wire_type)),
+                u.encoded_value.len(),
+                options.max_output_bytes,
+            )?;
             vi(make_key(u.number, u.wire_type), &mut o);
             o.extend_from_slice(&u.encoded_value)
         }
     }
     if options.forward_added_fields {
         for field in &m.added_fields {
-            if !(MIN_FIELD_NUMBER..=MAX_FIELD_NUMBER).contains(&field.number)
-                || !is_supported_wire_type(field.wire_type)
-            {
-                return Err(Error::new(0, "added field has invalid wire metadata"));
-            }
+            validate_raw_field(field.number, field.wire_type, &field.encoded_value)?;
+            ensure_output_growth(
+                o.len(),
+                minimal_varint_length(make_key(field.number, field.wire_type)),
+                field.encoded_value.len(),
+                options.max_output_bytes,
+            )?;
             vi(make_key(field.number, field.wire_type), &mut o);
             o.extend_from_slice(&field.encoded_value);
         }

@@ -143,6 +143,7 @@ fn response(schema: &Schema, request_bytes: &[u8]) -> Message {
                 payload,
                 &JsonDecodeOptions {
                     ignore_unknown_fields,
+                    ..JsonDecodeOptions::default()
                 },
             ),
             _ => {

@@ -18,6 +18,12 @@ Applications receiving untrusted data should use `decode_with_options` and
 choose finite limits appropriate to their protocol. Applications producing a
 sanitized output should use `encode_with_options`.
 
+`DecodeOptions::hardened()` supplies a finite, strict starting profile. It
+rejects unknown and duplicate fields, requires minimal varints and canonical
+booleans, rejects unknown enum values, and retains audit metadata without
+copying original wire bytes. Applications should still tune its finite limits
+to their protocol.
+
 Successful decoding means that the message passed all configured wire rules.
 It does not mean that the sender is authorized or that field values satisfy
 application-specific business rules.
@@ -44,9 +50,14 @@ The following checks apply to both compatibility and strict decoding:
 - Missing proto2 required fields are rejected after decoding.
 - Missing proto2 required fields are rejected before encoding.
 - Dynamic values incompatible with their field descriptors are rejected by the
-  encoder.
+  encoder. Repeated fields require `Value::Repeated`, singular fields reject
+  it, only one member of a oneof may be populated, dynamic map keys must be
+  unique, and closed enums reject unknown values.
 - Invalid numeric field IDs and wire types on application-added raw fields are
   rejected by the encoder.
+- Unknown, added, and duplicate-replay buffers must contain exactly one complete
+  wire value whose key metadata agrees with its audit record. Truncated values
+  and trailing injected occurrences are rejected.
 - Public codec APIs return `Result`; malformed input is covered by explicit
   no-panic tests.
 
@@ -210,13 +221,32 @@ bits.
 
 ### Output budget
 
-`max_output_bytes` rejects each completed root or embedded serialized message
-whose encoded size exceeds the configured budget.
+`max_output_bytes` rejects each root or embedded serialized message whose
+encoded size exceeds the configured budget. Length-delimited values, maps,
+packed fields, forwarded raw values, and duplicate replay are checked before
+their bytes are appended, preventing a large append from first growing the
+output beyond the limit. Field-number sorting may temporarily hold both the
+bounded original and reordered output buffers.
 
-This is a final encoded-size guard. The current encoder builds a message in
-memory before checking its final size; it is not a streaming allocation limit.
-Applications must also bound programmatically created messages, maps, repeated
-values, bytes, and strings.
+## Protobuf JSON sanitization
+
+`JsonDecodeOptions::hardened()` applies finite limits to the UTF-8 input,
+nesting depth, object members, array elements, individual strings, and decoded
+base64 bytes. Duplicate protobuf fields are tracked by descriptor identity, so
+using both proto and JSON spellings cannot evade duplicate rejection.
+
+JSON 64-bit integers, including exponent spellings, are converted with checked
+decimal arithmetic rather than binary floating-point boundary comparisons.
+Bytes fields validate base64 padding and the absence of data after padding;
+protobuf-compatible noncanonical unused bits remain accepted. Timestamp
+seconds must use the normalized 0 through 59 range.
+
+## Untrusted schema registries
+
+`SchemaParseOptions::hardened()` limits each `.proto` source's byte size, token
+count, and brace nesting as well as the number of reachable registry files.
+Use `parse_with_options` or `Registry::parse_with_options` when schemas are not
+fully controlled by the application.
 
 ## Example hardened profile
 

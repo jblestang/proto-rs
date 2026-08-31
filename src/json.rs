@@ -6,8 +6,13 @@
 //! generated protobuf message code or standard-library I/O is involved.
 
 use crate::{
-    Cardinality, Enum, Error, FieldType, Message, MessageDescriptor, Result, Schema, Value, decode,
-    encode,
+    Cardinality, Enum, Error, FieldType, Message, MessageDescriptor, Result, Schema, Value,
+    constants::{
+        HARDENED_JSON_MAX_ARRAY_VALUES, HARDENED_JSON_MAX_DECODED_BYTES,
+        HARDENED_JSON_MAX_INPUT_BYTES, HARDENED_JSON_MAX_NESTING_DEPTH,
+        HARDENED_JSON_MAX_OBJECT_FIELDS, HARDENED_JSON_MAX_STRING_BYTES,
+    },
+    decode, encode,
 };
 use alloc::{
     collections::BTreeSet,
@@ -18,10 +23,51 @@ use alloc::{
 use serde_json::{Map as JsonMap, Number, Value as JsonValue};
 
 /// Controls acceptance of schema-unknown JSON object members.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JsonDecodeOptions {
     /// Ignore unknown members when true; reject them when false.
     pub ignore_unknown_fields: bool,
+    /// Maximum UTF-8 input size accepted before JSON parsing allocates.
+    pub max_input_bytes: usize,
+    /// Maximum nested JSON object/array depth.
+    pub max_nesting_depth: usize,
+    /// Maximum members allowed in any JSON object.
+    pub max_object_fields: usize,
+    /// Maximum elements allowed in any JSON array.
+    pub max_array_values: usize,
+    /// Maximum bytes allowed in one JSON string spelling.
+    pub max_string_bytes: usize,
+    /// Maximum bytes produced by one protobuf bytes-field base64 value.
+    pub max_decoded_bytes: usize,
+}
+
+impl Default for JsonDecodeOptions {
+    fn default() -> Self {
+        Self {
+            ignore_unknown_fields: false,
+            max_input_bytes: usize::MAX,
+            max_nesting_depth: 128,
+            max_object_fields: usize::MAX,
+            max_array_values: usize::MAX,
+            max_string_bytes: usize::MAX,
+            max_decoded_bytes: usize::MAX,
+        }
+    }
+}
+
+impl JsonDecodeOptions {
+    /// Returns finite limits suitable for parsing hostile JSON documents.
+    pub const fn hardened() -> Self {
+        Self {
+            ignore_unknown_fields: false,
+            max_input_bytes: HARDENED_JSON_MAX_INPUT_BYTES,
+            max_nesting_depth: HARDENED_JSON_MAX_NESTING_DEPTH,
+            max_object_fields: HARDENED_JSON_MAX_OBJECT_FIELDS,
+            max_array_values: HARDENED_JSON_MAX_ARRAY_VALUES,
+            max_string_bytes: HARDENED_JSON_MAX_STRING_BYTES,
+            max_decoded_bytes: HARDENED_JSON_MAX_DECODED_BYTES,
+        }
+    }
 }
 
 /// Decodes protobuf JSON using strict unknown-field handling.
@@ -50,7 +96,10 @@ pub fn decode_json_with_options(
     input: &str,
     options: &JsonDecodeOptions,
 ) -> Result<Message> {
-    reject_duplicate_json_keys(input)?;
+    if input.len() > options.max_input_bytes {
+        return Err(Error::new(0, "JSON input exceeds configured size limit"));
+    }
+    reject_duplicate_json_keys(input, options)?;
     let json: JsonValue = serde_json::from_str(input)
         .map_err(|error| Error::new(error.column(), format!("invalid JSON: {error}")))?;
     json_to_message(schema, descriptor, &json, options)
@@ -84,6 +133,7 @@ fn json_to_message(
         .as_object()
         .ok_or_else(|| Error::new(0, "protobuf JSON message must be an object"))?;
     let mut message = Message::new();
+    let mut seen_fields = BTreeSet::new();
     for (json_name, json_value) in object {
         let field = schema.fields_for(descriptor).find(|field| {
             field.json_name() == *json_name
@@ -96,6 +146,9 @@ fn json_to_message(
             }
             return Err(Error::new(0, format!("unknown JSON field: {json_name}")));
         };
+        if !seen_fields.insert(field.name.as_str()) {
+            return Err(Error::new(0, format!("duplicate JSON field: {json_name}")));
+        }
         if options.ignore_unknown_fields && unknown_enum_name(schema, &field.kind, json_value) {
             continue;
         }
@@ -110,9 +163,6 @@ fn json_to_message(
             )
         {
             continue;
-        }
-        if message.get(&field.name).is_some() {
-            return Err(Error::new(0, format!("duplicate JSON field: {json_name}")));
         }
         if let Some(oneof) = &field.oneof
             && descriptor.fields.iter().any(|candidate| {
@@ -191,11 +241,11 @@ fn json_to_scalar(
                 .ok_or_else(|| Error::new(0, "string JSON field must be a string"))?
                 .to_string(),
         ),
-        FieldType::Bytes => {
-            Value::Bytes(base64_decode(json.as_str().ok_or_else(|| {
-                Error::new(0, "bytes JSON field must be a string")
-            })?)?)
-        }
+        FieldType::Bytes => Value::Bytes(base64_decode(
+            json.as_str()
+                .ok_or_else(|| Error::new(0, "bytes JSON field must be a string"))?,
+            options.max_decoded_bytes,
+        )?),
         FieldType::Enum(name) => Value::Enum(json_enum(
             schema
                 .enums
@@ -410,21 +460,14 @@ fn integer_i64(json: &JsonValue) -> Result<i64> {
         if !value.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
             return Err(Error::new(0, "invalid signed integer JSON value"));
         }
-        return float_integer(value).and_then(|number| {
-            if number < i64::MIN as f64 || number > i64::MAX as f64 {
-                Err(Error::new(0, "signed integer JSON value out of range"))
-            } else {
-                Ok(number as i64)
-            }
-        });
+        return exact_decimal_integer(value)?
+            .try_into()
+            .map_err(|_| Error::new(0, "signed integer JSON value out of range"));
     }
-    if let Some(value) = json.as_f64()
-        && value.is_finite()
-        && value % 1.0 == 0.0
-        && value >= i64::MIN as f64
-        && value <= i64::MAX as f64
-    {
-        return Ok(value as i64);
+    if let Some(number) = json.as_number() {
+        return exact_decimal_integer(&number.to_string())?
+            .try_into()
+            .map_err(|_| Error::new(0, "signed integer JSON value out of range"));
     }
     Err(Error::new(
         0,
@@ -443,21 +486,14 @@ fn integer_u64(json: &JsonValue) -> Result<u64> {
         if !value.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
             return Err(Error::new(0, "invalid unsigned integer JSON value"));
         }
-        return float_integer(value).and_then(|number| {
-            if number < 0.0 || number > u64::MAX as f64 {
-                Err(Error::new(0, "unsigned integer JSON value out of range"))
-            } else {
-                Ok(number as u64)
-            }
-        });
+        return exact_decimal_integer(value)?
+            .try_into()
+            .map_err(|_| Error::new(0, "unsigned integer JSON value out of range"));
     }
-    if let Some(value) = json.as_f64()
-        && value.is_finite()
-        && value % 1.0 == 0.0
-        && value >= 0.0
-        && value <= u64::MAX as f64
-    {
-        return Ok(value as u64);
+    if let Some(number) = json.as_number() {
+        return exact_decimal_integer(&number.to_string())?
+            .try_into()
+            .map_err(|_| Error::new(0, "unsigned integer JSON value out of range"));
     }
     Err(Error::new(
         0,
@@ -480,12 +516,64 @@ fn json_float(json: &JsonValue) -> Result<f64> {
     }
 }
 
-fn float_integer(value: &str) -> Result<f64> {
-    let value: f64 = value
-        .parse()
-        .map_err(|_| Error::new(0, "invalid integer JSON value"))?;
-    if !value.is_finite() || value % 1.0 != 0.0 {
-        return Err(Error::new(0, "integer JSON value is not integral"));
+fn exact_decimal_integer(text: &str) -> Result<i128> {
+    let (negative, unsigned) = if let Some(value) = text.strip_prefix('-') {
+        (true, value)
+    } else if let Some(value) = text.strip_prefix('+') {
+        (false, value)
+    } else {
+        (false, text)
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            exponent
+                .parse::<i32>()
+                .map_err(|_| Error::new(0, "invalid integer JSON exponent"))?,
+        ),
+        None => (unsigned, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(Error::new(0, "invalid integer JSON value"));
+    }
+    let mut value = 0i128;
+    for digit in whole.bytes().chain(fraction.bytes()) {
+        value = value
+            .checked_mul(10)
+            .and_then(|current| current.checked_add(i128::from(digit - b'0')))
+            .ok_or_else(|| Error::new(0, "integer JSON value out of range"))?;
+    }
+    let scale = i64::try_from(fraction.len())
+        .map_err(|_| Error::new(0, "integer JSON fraction is too long"))?
+        - i64::from(exponent);
+    if scale.unsigned_abs() > 39 {
+        if value == 0 {
+            return Ok(0);
+        }
+        return Err(Error::new(0, "integer JSON value out of range"));
+    }
+    if scale > 0 {
+        for _ in 0..scale {
+            if value % 10 != 0 {
+                return Err(Error::new(0, "integer JSON value is not integral"));
+            }
+            value /= 10;
+        }
+    } else {
+        for _ in scale..0 {
+            value = value
+                .checked_mul(10)
+                .ok_or_else(|| Error::new(0, "integer JSON value out of range"))?;
+        }
+    }
+    if negative {
+        value = value
+            .checked_neg()
+            .ok_or_else(|| Error::new(0, "integer JSON value out of range"))?;
     }
     Ok(value)
 }
@@ -954,7 +1042,7 @@ fn parse_timestamp(json: &JsonValue) -> Result<Message> {
         || day > days_in_month(year, month)
         || hour > 23
         || minute > 59
-        || second > 60
+        || second > 59
     {
         return Err(Error::new(0, "invalid Timestamp date or time"));
     }
@@ -996,13 +1084,9 @@ fn parse_timestamp(json: &JsonValue) -> Result<Message> {
         }
         _ => return Err(Error::new(0, "Timestamp requires Z or a numeric offset")),
     };
-    let leap = i64::from(second == 60);
-    let seconds = days_from_civil(year, month, day) * SECONDS_PER_DAY
-        + hour * 3600
-        + minute * 60
-        + second.min(59)
-        + leap
-        - offset;
+    let seconds =
+        days_from_civil(year, month, day) * SECONDS_PER_DAY + hour * 3600 + minute * 60 + second
+            - offset;
     validate_timestamp(seconds, nanos)?;
     let mut message = Message::new();
     if seconds != 0 {
@@ -1203,12 +1287,17 @@ fn base64_encode(input: &[u8]) -> String {
     output
 }
 
-fn base64_decode(input: &str) -> Result<Vec<u8>> {
+fn base64_decode(input: &str, max_decoded_bytes: usize) -> Result<Vec<u8>> {
+    let padding = input.bytes().rev().take_while(|byte| *byte == b'=').count();
+    if padding > 2 || input[..input.len().saturating_sub(padding)].contains('=') {
+        return Err(Error::new(0, "invalid base64 padding"));
+    }
+    let data_len = input.len().saturating_sub(padding);
+    if padding != 0 && !input.len().is_multiple_of(4) {
+        return Err(Error::new(0, "invalid padded base64 length"));
+    }
     let mut sextets = Vec::new();
-    for byte in input.bytes() {
-        if byte == b'=' {
-            break;
-        }
+    for byte in input.bytes().take(data_len) {
         let value = match byte {
             b'A'..=b'Z' => byte - b'A',
             b'a'..=b'z' => byte - b'a' + 26,
@@ -1222,7 +1311,24 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
     if sextets.len() % 4 == 1 {
         return Err(Error::new(0, "invalid base64 length"));
     }
-    let mut output = Vec::with_capacity(sextets.len() * 3 / 4);
+    if (padding == 1 && sextets.len() % 4 != 3) || (padding == 2 && sextets.len() % 4 != 2) {
+        return Err(Error::new(0, "invalid base64 padding length"));
+    }
+    let tail = match sextets.len() % 4 {
+        2 => 1,
+        3 => 2,
+        _ => 0,
+    };
+    let decoded_len = sextets
+        .len()
+        .checked_div(4)
+        .and_then(|length| length.checked_mul(3))
+        .and_then(|length| length.checked_add(tail))
+        .ok_or_else(|| Error::new(0, "decoded base64 size overflow"))?;
+    if decoded_len > max_decoded_bytes {
+        return Err(Error::new(0, "decoded bytes exceed configured size limit"));
+    }
+    let mut output = Vec::with_capacity(decoded_len);
     for chunk in sextets.chunks(4) {
         let value = (u32::from(chunk[0]) << 18)
             | (u32::from(*chunk.get(1).unwrap_or(&0)) << 12)
@@ -1239,18 +1345,26 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-fn reject_duplicate_json_keys(input: &str) -> Result<()> {
+fn reject_duplicate_json_keys(input: &str, options: &JsonDecodeOptions) -> Result<()> {
     let mut cursor = 0;
-    scan_json_value(input.as_bytes(), &mut cursor)?;
+    scan_json_value(input.as_bytes(), &mut cursor, options, 0)?;
     Ok(())
 }
 
-fn scan_json_value(bytes: &[u8], cursor: &mut usize) -> Result<()> {
+fn scan_json_value(
+    bytes: &[u8],
+    cursor: &mut usize,
+    options: &JsonDecodeOptions,
+    depth: usize,
+) -> Result<()> {
+    if depth > options.max_nesting_depth {
+        return Err(Error::new(*cursor, "JSON exceeds configured nesting limit"));
+    }
     skip_json_space(bytes, cursor);
     match bytes.get(*cursor) {
-        Some(b'{') => scan_json_object(bytes, cursor),
-        Some(b'[') => scan_json_array(bytes, cursor),
-        Some(b'"') => scan_json_string(bytes, cursor),
+        Some(b'{') => scan_json_object(bytes, cursor, options, depth),
+        Some(b'[') => scan_json_array(bytes, cursor, options, depth),
+        Some(b'"') => scan_json_string(bytes, cursor, options),
         Some(_) => {
             while bytes
                 .get(*cursor)
@@ -1264,7 +1378,12 @@ fn scan_json_value(bytes: &[u8], cursor: &mut usize) -> Result<()> {
     }
 }
 
-fn scan_json_object(bytes: &[u8], cursor: &mut usize) -> Result<()> {
+fn scan_json_object(
+    bytes: &[u8],
+    cursor: &mut usize,
+    options: &JsonDecodeOptions,
+    depth: usize,
+) -> Result<()> {
     *cursor += 1;
     let mut names = BTreeSet::new();
     loop {
@@ -1274,7 +1393,13 @@ fn scan_json_object(bytes: &[u8], cursor: &mut usize) -> Result<()> {
             return Ok(());
         }
         let start = *cursor;
-        scan_json_string(bytes, cursor)?;
+        if names.len() >= options.max_object_fields {
+            return Err(Error::new(
+                start,
+                "JSON object exceeds configured field limit",
+            ));
+        }
+        scan_json_string(bytes, cursor, options)?;
         let key: String = serde_json::from_slice(
             bytes
                 .get(start..*cursor)
@@ -1289,7 +1414,7 @@ fn scan_json_object(bytes: &[u8], cursor: &mut usize) -> Result<()> {
             return Err(Error::new(*cursor, "JSON object key requires colon"));
         }
         *cursor += 1;
-        scan_json_value(bytes, cursor)?;
+        scan_json_value(bytes, cursor, options, depth + 1)?;
         skip_json_space(bytes, cursor);
         match bytes.get(*cursor) {
             Some(b',') => *cursor += 1,
@@ -1302,15 +1427,28 @@ fn scan_json_object(bytes: &[u8], cursor: &mut usize) -> Result<()> {
     }
 }
 
-fn scan_json_array(bytes: &[u8], cursor: &mut usize) -> Result<()> {
+fn scan_json_array(
+    bytes: &[u8],
+    cursor: &mut usize,
+    options: &JsonDecodeOptions,
+    depth: usize,
+) -> Result<()> {
     *cursor += 1;
+    let mut values = 0usize;
     loop {
         skip_json_space(bytes, cursor);
         if bytes.get(*cursor) == Some(&b']') {
             *cursor += 1;
             return Ok(());
         }
-        scan_json_value(bytes, cursor)?;
+        if values >= options.max_array_values {
+            return Err(Error::new(
+                *cursor,
+                "JSON array exceeds configured value limit",
+            ));
+        }
+        values += 1;
+        scan_json_value(bytes, cursor, options, depth + 1)?;
         skip_json_space(bytes, cursor);
         match bytes.get(*cursor) {
             Some(b',') => *cursor += 1,
@@ -1323,14 +1461,21 @@ fn scan_json_array(bytes: &[u8], cursor: &mut usize) -> Result<()> {
     }
 }
 
-fn scan_json_string(bytes: &[u8], cursor: &mut usize) -> Result<()> {
+fn scan_json_string(bytes: &[u8], cursor: &mut usize, options: &JsonDecodeOptions) -> Result<()> {
     if bytes.get(*cursor) != Some(&b'"') {
         return Err(Error::new(*cursor, "JSON object key must be a string"));
     }
     *cursor += 1;
+    let start = *cursor;
     let mut escaped = false;
     while let Some(byte) = bytes.get(*cursor) {
         *cursor += 1;
+        if cursor.saturating_sub(start) > options.max_string_bytes {
+            return Err(Error::new(
+                start,
+                "JSON string exceeds configured size limit",
+            ));
+        }
         if escaped {
             escaped = false;
         } else if *byte == b'\\' {

@@ -155,6 +155,38 @@ pub(crate) const MAX_FIELD_KEY_BYTES: usize = 5;
 pub(crate) const MAX_TENTH_VARINT_BYTE: u8 = 1;
 /// Default maximum nested-message depth used by compatibility decoding.
 pub(crate) const DEFAULT_RECURSION_LIMIT: usize = 100;
+/// Maximum root or embedded message size in the hardened decoder profile.
+pub(crate) const HARDENED_MAX_MESSAGE_BYTES: usize = 1_048_576;
+/// Maximum field occurrences across a hardened decode operation.
+pub(crate) const HARDENED_MAX_FIELD_OCCURRENCES: usize = 65_536;
+/// Maximum size of one hardened length-delimited value.
+pub(crate) const HARDENED_MAX_LENGTH_DELIMITED_BYTES: usize = 262_144;
+/// Maximum retained values in one repeated field under the hardened profile.
+pub(crate) const HARDENED_MAX_REPEATED_VALUES: usize = 16_384;
+/// Maximum retained entries in one map under the hardened profile.
+pub(crate) const HARDENED_MAX_MAP_ENTRIES: usize = 16_384;
+/// Maximum original wire bytes retained by hardened metadata auditing.
+pub(crate) const HARDENED_MAX_AUDIT_BYTES: usize = 0;
+/// Maximum protobuf JSON document size in the hardened profile.
+pub(crate) const HARDENED_JSON_MAX_INPUT_BYTES: usize = 1_048_576;
+/// Maximum protobuf JSON nesting depth in the hardened profile.
+pub(crate) const HARDENED_JSON_MAX_NESTING_DEPTH: usize = 64;
+/// Maximum members in one hardened protobuf JSON object.
+pub(crate) const HARDENED_JSON_MAX_OBJECT_FIELDS: usize = 16_384;
+/// Maximum elements in one hardened protobuf JSON array.
+pub(crate) const HARDENED_JSON_MAX_ARRAY_VALUES: usize = 16_384;
+/// Maximum raw bytes in one hardened protobuf JSON string.
+pub(crate) const HARDENED_JSON_MAX_STRING_BYTES: usize = 262_144;
+/// Maximum decoded size of one hardened protobuf JSON bytes value.
+pub(crate) const HARDENED_JSON_MAX_DECODED_BYTES: usize = 262_144;
+/// Maximum bytes in one `.proto` source under hardened schema parsing.
+pub(crate) const HARDENED_SCHEMA_MAX_SOURCE_BYTES: usize = 1_048_576;
+/// Maximum lexical tokens in one hardened `.proto` source.
+pub(crate) const HARDENED_SCHEMA_MAX_TOKENS: usize = 131_072;
+/// Maximum brace nesting in one hardened `.proto` source.
+pub(crate) const HARDENED_SCHEMA_MAX_NESTING_DEPTH: usize = 64;
+/// Maximum reachable files in one hardened Registry parse.
+pub(crate) const HARDENED_SCHEMA_MAX_REGISTRY_FILES: usize = 256;
 /// Canonical quiet-NaN bit pattern used for normalized 32-bit floats.
 pub(crate) const CANONICAL_F32_NAN_BITS: u32 = 0x7fc0_0000;
 /// Canonical quiet-NaN bit pattern used for normalized 64-bit floats.
