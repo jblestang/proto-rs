@@ -1,6 +1,6 @@
 [package]
 name = "proto-rs-dynamic"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A no_std dynamic Protocol Buffers schema parser, sanitizer, and wire codec"

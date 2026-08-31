@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-31
+
+### Fixed
+
+- Avoid an unused-binding warning in the protobuf JSON `NullValue` encoder on
+  newer Rust toolchains, allowing builds with warnings denied.
+
 ## [0.2.0] - 2026-08-31
 
 ### Added
@@ -51,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Official protobuf conformance harness, unit tests, benchmarks, and a
   coverage-guided decoder fuzz target.
 
-[Unreleased]: https://github.com/jblestang/proto-rs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jblestang/proto-rs/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/jblestang/proto-rs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jblestang/proto-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jblestang/proto-rs/releases/tag/v0.1.0

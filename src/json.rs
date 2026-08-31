@@ -277,7 +277,7 @@ fn scalar_to_json(schema: &Schema, kind: &FieldType, value: &Value) -> Result<Js
                 .to_string(),
         ),
         (FieldType::Bytes, Value::Bytes(value)) => JsonValue::String(base64_encode(value)),
-        (FieldType::Enum(name), Value::Enum(value)) if name == "google.protobuf.NullValue" => {
+        (FieldType::Enum(name), Value::Enum(_value)) if name == "google.protobuf.NullValue" => {
             JsonValue::Null
         }
         (FieldType::Enum(name), Value::Enum(value)) => {
