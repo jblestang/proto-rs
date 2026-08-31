@@ -112,6 +112,7 @@ extern crate alloc;
 extern crate std;
 mod codec;
 mod constants;
+mod json;
 mod schema;
 use alloc::string::String;
 pub use codec::{
@@ -121,10 +122,12 @@ pub use codec::{
     decode_with_options, encode, encode_with_options,
 };
 use core::fmt;
+pub use json::{JsonDecodeOptions, decode_json, decode_json_with_options, encode_json};
 pub use schema::{
-    Cardinality, CustomOptionDescriptor, Enum, EnumValue, Field, FieldType, Import, ImportKind,
-    MessageDescriptor, MethodDescriptor, OneofDescriptor, OptionSetting, OptionValueKind, Registry,
-    Schema, ServiceDescriptor, Syntax, parse,
+    Cardinality, CustomOptionDescriptor, Enum, EnumType, EnumValue, ExtensionDescriptor,
+    FeatureSet, Field, FieldPresence, FieldType, Import, ImportKind, JsonFormat, MessageDescriptor,
+    MessageEncoding, MethodDescriptor, OneofDescriptor, OptionSetting, OptionValueKind, Registry,
+    RepeatedFieldEncoding, Schema, ServiceDescriptor, Syntax, Utf8Validation, parse,
 };
 /// Error returned when schema or wire data cannot be processed safely.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1317,6 +1320,215 @@ mod tests {
                 "schema unexpectedly accepted: {source}"
             );
         }
+    }
+
+    /// Verifies Edition 2023 declarations expose their official defaults.
+    #[test]
+    fn parses_edition_2023_defaults() {
+        let schema = parse(
+            r#"edition = "2023";
+               message Packet { int32 id = 1; repeated uint32 samples = 2; }"#,
+        )
+        .unwrap();
+        assert_eq!(schema.syntax, Syntax::Edition2023);
+        assert_eq!(schema.features.field_presence, FieldPresence::Explicit);
+        let packet = schema.message("Packet").unwrap();
+        assert!(packet.field_by_name("id").unwrap().explicit_presence);
+        assert_eq!(packet.field_by_name("samples").unwrap().packed, Some(true));
+    }
+
+    /// Verifies inherited Edition features affect field wire metadata.
+    #[test]
+    fn resolves_edition_2023_feature_overrides() {
+        let schema = parse(
+            r#"edition = "2023";
+               option features.field_presence = IMPLICIT;
+               message Packet {
+                 repeated uint32 samples = 1
+                   [features.repeated_field_encoding = EXPANDED];
+                 int32 count = 2 [features.field_presence = EXPLICIT];
+               }"#,
+        )
+        .unwrap();
+        let packet = schema.message("Packet").unwrap();
+        assert_eq!(packet.features.field_presence, FieldPresence::Implicit);
+        assert_eq!(packet.field_by_name("samples").unwrap().packed, Some(false));
+        assert!(packet.field_by_name("count").unwrap().explicit_presence);
+    }
+
+    /// Verifies Editions reject labels removed from the language grammar.
+    #[test]
+    fn rejects_labels_in_edition_2023() {
+        for label in ["optional", "required"] {
+            let source =
+                alloc::format!("edition = \"2023\"; message Packet {{ {label} int32 id = 1; }}");
+            assert!(parse(&source).is_err());
+        }
+    }
+
+    /// Verifies Edition feature settings cannot alter proto3 source semantics.
+    #[test]
+    fn rejects_editions_features_in_proto3() {
+        assert!(
+            parse(
+                r#"syntax = "proto3";
+                   option features.field_presence = EXPLICIT;
+                   message Packet {}"#
+            )
+            .is_err()
+        );
+    }
+
+    /// Verifies DELIMITED known messages use matching group tags and round trip.
+    #[test]
+    fn edition_delimited_messages_round_trip() {
+        let schema = parse(
+            r#"edition = "2023";
+               message Child { int32 value = 1; }
+               message Parent {
+                 Child child = 2 [features.message_encoding = DELIMITED];
+               }"#,
+        )
+        .unwrap();
+        let parent = schema.message("Parent").unwrap();
+        let mut child = Message::new();
+        child.insert("value", Value::Int32(7));
+        let mut message = Message::new();
+        message.insert("child", Value::Message(child));
+        let bytes = encode(&schema, parent, &message).unwrap();
+        assert_eq!(bytes, [0x13, 0x08, 0x07, 0x14]);
+        assert_eq!(decode(&schema, parent, &bytes).unwrap(), message);
+    }
+
+    /// Verifies LEGACY_REQUIRED is enforced during both decode and encode.
+    #[test]
+    fn edition_legacy_required_is_enforced() {
+        let schema = parse(
+            r#"edition = "2023";
+               message Packet {
+                 int32 id = 1 [features.field_presence = LEGACY_REQUIRED];
+               }"#,
+        )
+        .unwrap();
+        let packet = schema.message("Packet").unwrap();
+        assert!(decode(&schema, packet, &[]).is_err());
+        assert!(encode(&schema, packet, &Message::new()).is_err());
+    }
+
+    /// Verifies UTF-8 NONE preserves arbitrary string bytes losslessly.
+    #[test]
+    fn edition_unverified_strings_round_trip() {
+        let schema = parse(
+            r#"edition = "2023";
+               message Packet {
+                 string text = 1 [features.utf8_validation = NONE];
+               }"#,
+        )
+        .unwrap();
+        let packet = schema.message("Packet").unwrap();
+        let bytes = [0x0a, 0x02, 0xff, 0xfe];
+        let decoded = decode(&schema, packet, &bytes).unwrap();
+        assert_eq!(
+            decoded.get("text"),
+            Some(&Value::RawString(vec![0xff, 0xfe]))
+        );
+        assert_eq!(encode(&schema, packet, &decoded).unwrap(), bytes);
+    }
+
+    /// Verifies closed enum unknown numbers move to the unknown-field set.
+    #[test]
+    fn edition_closed_enum_values_are_unknown_fields() {
+        let schema = parse(
+            r#"edition = "2023";
+               enum State {
+                 option features.enum_type = CLOSED;
+                 ZERO = 0;
+               }
+               message Packet { State state = 1; }"#,
+        )
+        .unwrap();
+        let packet = schema.message("Packet").unwrap();
+        let decoded = decode(&schema, packet, &[0x08, 0x07]).unwrap();
+        assert!(decoded.get("state").is_none());
+        assert_eq!(decoded.unknown_fields.len(), 1);
+        assert_eq!(encode(&schema, packet, &decoded).unwrap(), [0x08, 0x07]);
+    }
+
+    /// Verifies descriptor-driven protobuf JSON scalar, enum, repeated, and map mappings.
+    #[test]
+    fn protobuf_json_round_trip() {
+        let schema = parse(
+            r#"syntax = "proto3";
+               enum State { ZERO = 0; READY = 1; }
+               message Packet {
+                 int64 sequence_id = 1;
+                 bytes body = 2;
+                 State state = 3;
+                 repeated uint32 samples = 4;
+                 map<string, int32> counts = 5;
+               }"#,
+        )
+        .unwrap();
+        let packet = schema.message("Packet").unwrap();
+        let json = r#"{
+          "sequenceId":"9007199254740993",
+          "body":"AQI=",
+          "state":"READY",
+          "samples":[1,2],
+          "counts":{"ok":3}
+        }"#;
+        let message = decode_json(&schema, packet, json).unwrap();
+        assert_eq!(
+            message.get("sequence_id"),
+            Some(&Value::Int64(9_007_199_254_740_993))
+        );
+        assert_eq!(message.get("body"), Some(&Value::Bytes(vec![1, 2])));
+        let encoded = encode_json(&schema, packet, &message).unwrap();
+        let reparsed = decode_json(&schema, packet, &encoded).unwrap();
+        assert_eq!(reparsed, message);
+    }
+
+    /// Verifies typed extensions resolve, participate in the codec, and obey ranges.
+    #[test]
+    fn typed_extensions_are_semantically_validated() {
+        let schema = parse(
+            r#"edition = "2023";
+               message Packet { extensions 100 to 199; }
+               extend Packet { int32 audit_code = 100; }"#,
+        )
+        .unwrap();
+        let packet = schema.message("Packet").unwrap();
+        let mut message = Message::new();
+        message.insert("audit_code", Value::Int32(7));
+        let bytes = encode(&schema, packet, &message).unwrap();
+        assert_eq!(decode(&schema, packet, &bytes).unwrap(), message);
+
+        assert!(
+            parse(
+                r#"edition = "2023";
+                   message Packet { extensions 100 to 199; }
+                   extend Packet { int32 outside = 200; }"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                r#"edition = "2023";
+                   message Packet { int32 regular = 100; extensions 100 to 199; }
+                   extend Packet { int32 collision = 100; }"#
+            )
+            .is_err()
+        );
+    }
+
+    /// Verifies duplicate JSON names and malformed well-known values are rejected.
+    #[test]
+    fn protobuf_json_semantics_reject_invalid_inputs() {
+        let schema = parse(r#"syntax = "proto3"; message Packet { int32 value = 1; }"#).unwrap();
+        let packet = schema.message("Packet").unwrap();
+        assert!(decode_json(&schema, packet, r#"{"value":1,"value":2}"#).is_err());
+        assert!(decode_json(&schema, packet, r#"{"unknown":1}"#).is_err());
+        assert!(decode_json(&schema, packet, r#"{"value":"9223372036854775808"}"#).is_err());
     }
 
     /// Import cycles and proto3 references to proto2 enums are semantic errors.

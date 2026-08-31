@@ -7,6 +7,8 @@ pub(crate) const LONG_UNICODE_ESCAPE_DIGITS: usize = 8;
 
 /// `syntax` declaration keyword.
 pub(crate) const KW_SYNTAX: &str = "syntax";
+/// `edition` declaration keyword.
+pub(crate) const KW_EDITION: &str = "edition";
 /// `package` declaration keyword.
 pub(crate) const KW_PACKAGE: &str = "package";
 /// `import` declaration keyword.
@@ -65,6 +67,20 @@ pub(crate) const BOOLEAN_FALSE: &str = "false";
 pub(crate) const SYNTAX_PROTO2: &str = "proto2";
 /// Source spelling selecting proto3 parsing rules.
 pub(crate) const SYNTAX_PROTO3: &str = "proto3";
+/// Source spelling selecting the first protobuf edition.
+pub(crate) const EDITION_2023: &str = "2023";
+/// Fully-qualified built-in feature selecting singular-field presence.
+pub(crate) const FEATURE_FIELD_PRESENCE: &str = "features.field_presence";
+/// Fully-qualified built-in feature selecting open or closed enums.
+pub(crate) const FEATURE_ENUM_TYPE: &str = "features.enum_type";
+/// Fully-qualified built-in feature selecting packed repeated encoding.
+pub(crate) const FEATURE_REPEATED_ENCODING: &str = "features.repeated_field_encoding";
+/// Fully-qualified built-in feature selecting message wire encoding.
+pub(crate) const FEATURE_MESSAGE_ENCODING: &str = "features.message_encoding";
+/// Fully-qualified built-in feature selecting string validation.
+pub(crate) const FEATURE_UTF8_VALIDATION: &str = "features.utf8_validation";
+/// Fully-qualified built-in feature selecting JSON availability.
+pub(crate) const FEATURE_JSON_FORMAT: &str = "features.json_format";
 
 /// Source spelling of the protobuf `double` scalar type.
 pub(crate) const TYPE_DOUBLE: &str = "double";

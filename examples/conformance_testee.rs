@@ -3,7 +3,10 @@
 //! Usage:
 //! `conformance_test_runner target/debug/examples/conformance_testee /path/to/protobuf`
 
-use proto_rs::{Message, Registry, Schema, Value, decode, encode};
+use proto_rs::{
+    JsonDecodeOptions, Message, Registry, Schema, Value, decode, decode_json_with_options, encode,
+    encode_json,
+};
 use std::{
     env, fs,
     io::{self, Read, Write},
@@ -20,6 +23,8 @@ const FORMAT_JSON: i32 = 2;
 const FORMAT_JSPB: i32 = 3;
 /// Conformance protocol value requesting protobuf text-format output.
 const FORMAT_TEXT: i32 = 4;
+/// Conformance category requesting unknown JSON members be ignored.
+const CATEGORY_JSON_IGNORE_UNKNOWN: i32 = 3;
 /// Bytes in the little-endian request and response length prefix.
 const FRAME_LENGTH_SIZE: usize = core::mem::size_of::<u32>();
 
@@ -46,6 +51,9 @@ fn load_schema(root: &Path) -> Result<Schema, String> {
         "conformance_root.proto".into(),
         r#"syntax = "proto3";
            import "conformance/conformance.proto";
+           import "conformance/test_protos/test_messages_edition2023.proto";
+           import "editions/golden/test_messages_proto2_editions.proto";
+           import "editions/golden/test_messages_proto3_editions.proto";
            import "google/protobuf/test_messages_proto2.proto";
            import "google/protobuf/test_messages_proto3.proto";"#
             .into(),
@@ -58,6 +66,12 @@ fn load_schema(root: &Path) -> Result<Schema, String> {
     .map_err(|error| error.to_string())?;
     collect(
         root.join("conformance").as_path(),
+        root.to_str().unwrap(),
+        &mut owned,
+    )
+    .map_err(|error| error.to_string())?;
+    collect(
+        root.join("editions").as_path(),
         root.to_str().unwrap(),
         &mut owned,
     )
@@ -101,41 +115,61 @@ fn response(schema: &Schema, request_bytes: &[u8]) -> Message {
         Some(Value::Enum(value)) => *value,
         _ => FORMAT_UNSPECIFIED,
     };
-    if request.get("json_payload").is_some() || requested_format == FORMAT_JSON {
-        return skipped("protobuf JSON is not implemented");
-    }
     if request.get("text_payload").is_some() || requested_format == FORMAT_TEXT {
         return skipped("protobuf text format is not implemented");
     }
     if request.get("jspb_payload").is_some() || requested_format == FORMAT_JSPB {
         return skipped("JSPB is not implemented");
     }
-    if message_type.starts_with("protobuf_test_messages.editions.")
-        || message_type.starts_with("protobuf_test_messages.edition_unstable.")
-    {
-        return skipped("protobuf Editions are not implemented");
+    if message_type.starts_with("protobuf_test_messages.edition_unstable.") {
+        return skipped("unstable protobuf Editions are not implemented");
     }
-    let payload = match request.get("protobuf_payload") {
-        Some(Value::Bytes(payload)) if requested_format == FORMAT_PROTOBUF => payload,
-        _ => {
-            return field(
-                "runtime_error",
-                Value::String("invalid binary request".into()),
-            );
-        }
-    };
     let Some(descriptor) = schema.message(message_type) else {
         return field(
             "runtime_error",
             Value::String(format!("unexpected message type: {message_type}")),
         );
     };
-    match decode(schema, descriptor, payload) {
-        Ok(value) => match encode(schema, descriptor, &value) {
+    let ignore_unknown_fields = matches!(
+        request.get("test_category"),
+        Some(Value::Enum(CATEGORY_JSON_IGNORE_UNKNOWN))
+    );
+    let decoded = match request.get("protobuf_payload") {
+        Some(Value::Bytes(payload)) => decode(schema, descriptor, payload),
+        _ => match request.get("json_payload") {
+            Some(Value::String(payload)) => decode_json_with_options(
+                schema,
+                descriptor,
+                payload,
+                &JsonDecodeOptions {
+                    ignore_unknown_fields,
+                },
+            ),
+            _ => {
+                return field(
+                    "runtime_error",
+                    Value::String("invalid request payload".into()),
+                );
+            }
+        },
+    };
+    let value = match decoded {
+        Ok(value) => value,
+        Err(error) => return field("parse_error", Value::String(error.to_string())),
+    };
+    match requested_format {
+        FORMAT_PROTOBUF => match encode(schema, descriptor, &value) {
             Ok(bytes) => field("protobuf_payload", Value::Bytes(bytes)),
             Err(error) => field("serialize_error", Value::String(error.to_string())),
         },
-        Err(error) => field("parse_error", Value::String(error.to_string())),
+        FORMAT_JSON => match encode_json(schema, descriptor, &value) {
+            Ok(json) => field("json_payload", Value::String(json)),
+            Err(error) => field("serialize_error", Value::String(error.to_string())),
+        },
+        _ => field(
+            "runtime_error",
+            Value::String("unsupported output format".into()),
+        ),
     }
 }
 

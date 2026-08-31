@@ -308,15 +308,18 @@
 //! Basic proto2 binary behavior uses the same dynamic descriptors and codec.
 //! Basic proto2 includes ordinary scalars, messages, enums, maps, and oneofs.
 //! Basic proto2 includes required-field checks and explicit packing options.
-//! Declared legacy groups, ordinary extensions, and MessageSet are unsupported.
-//! Editions syntax and feature resolution are not implemented.
+//! Declared legacy groups and MessageSet reflection are unsupported.
+//! Edition 2023 syntax and its standard inherited features are implemented.
+//! Typed ordinary extensions and extension ranges are resolved and validated.
 //! JSON and text-format parsing belong to separate future codec layers.
 //! The repository's `CONFORMANCE.md` is the authoritative support declaration.
 
 use crate::{
     Error, Result,
     constants::{
-        BOOLEAN_FALSE, BOOLEAN_TRUE, CUSTOM_OPTION_MIN_FIELD_NUMBER, KW_ENUM, KW_EXTEND,
+        BOOLEAN_FALSE, BOOLEAN_TRUE, CUSTOM_OPTION_MIN_FIELD_NUMBER, EDITION_2023,
+        FEATURE_ENUM_TYPE, FEATURE_FIELD_PRESENCE, FEATURE_JSON_FORMAT, FEATURE_MESSAGE_ENCODING,
+        FEATURE_REPEATED_ENCODING, FEATURE_UTF8_VALIDATION, KW_EDITION, KW_ENUM, KW_EXTEND,
         KW_EXTENSIONS, KW_GROUP, KW_IMPORT, KW_MAP, KW_MAX, KW_MESSAGE, KW_ONEOF, KW_OPTION,
         KW_OPTIONAL, KW_PACKAGE, KW_PUBLIC, KW_REPEATED, KW_REQUIRED, KW_RESERVED, KW_RETURNS,
         KW_RPC, KW_SERVICE, KW_STREAM, KW_SYNTAX, KW_TO, KW_WEAK, LONG_UNICODE_ESCAPE_DIGITS,
@@ -336,7 +339,7 @@ use alloc::{
 };
 use pest::{Parser as _, error::InputLocation};
 
-/// Pest-generated parser for the checked-in proto2/proto3 grammar.
+/// Pest-generated parser for the checked-in proto2/proto3/Edition grammar.
 #[derive(pest_derive::Parser)]
 #[grammar = "proto.pest"]
 struct ProtoSyntaxParser;
@@ -363,6 +366,125 @@ pub enum Syntax {
     Proto2,
     /// Protocol Buffers version 3 syntax.
     Proto3,
+    /// Protocol Buffers Edition 2023 source and default feature set.
+    Edition2023,
+}
+
+impl Syntax {
+    /// Returns whether this language version uses proto3-like defaults.
+    const fn has_modern_defaults(self) -> bool {
+        matches!(self, Self::Proto3 | Self::Edition2023)
+    }
+
+    /// Returns whether source labels are governed by Editions rules.
+    const fn is_edition(self) -> bool {
+        matches!(self, Self::Edition2023)
+    }
+}
+
+/// Resolved singular-field presence behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FieldPresence {
+    /// Singular scalar fields track presence.
+    Explicit,
+    /// Singular scalar fields use default-value elision.
+    Implicit,
+    /// Absence is a message initialization error.
+    LegacyRequired,
+}
+
+/// Resolved handling of numeric values absent from an enum declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnumType {
+    /// Unknown numeric values remain values of the enum field.
+    Open,
+    /// Unknown numeric values belong to the unknown-field set.
+    Closed,
+}
+
+/// Resolved wire representation for repeated packable primitives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepeatedFieldEncoding {
+    /// Emit one length-delimited packed occurrence.
+    Packed,
+    /// Emit one ordinary occurrence per element.
+    Expanded,
+}
+
+/// Resolved wire representation for embedded messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageEncoding {
+    /// Emit an ordinary length-delimited message.
+    LengthPrefixed,
+    /// Emit matching start-group and end-group tags.
+    Delimited,
+}
+
+/// Resolved validation behavior for protobuf string fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Utf8Validation {
+    /// Reject wire strings that are not valid UTF-8.
+    Verify,
+    /// Preserve string payloads without UTF-8 validation.
+    None,
+}
+
+/// Resolved JSON availability for a declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JsonFormat {
+    /// JSON serialization is permitted.
+    Allow,
+    /// JSON serialization is deliberately disabled.
+    LegacyBestEffort,
+}
+
+/// Inherited protobuf language features resolved for a descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FeatureSet {
+    /// Singular-field presence behavior.
+    pub field_presence: FieldPresence,
+    /// Enum openness behavior.
+    pub enum_type: EnumType,
+    /// Default repeated primitive encoding.
+    pub repeated_field_encoding: RepeatedFieldEncoding,
+    /// Embedded-message encoding.
+    pub message_encoding: MessageEncoding,
+    /// String payload validation.
+    pub utf8_validation: Utf8Validation,
+    /// JSON availability.
+    pub json_format: JsonFormat,
+}
+
+impl FeatureSet {
+    /// Returns the defaults associated with a source language version.
+    pub const fn for_syntax(syntax: Syntax) -> Self {
+        match syntax {
+            Syntax::Proto2 => Self {
+                field_presence: FieldPresence::Explicit,
+                enum_type: EnumType::Closed,
+                repeated_field_encoding: RepeatedFieldEncoding::Expanded,
+                message_encoding: MessageEncoding::LengthPrefixed,
+                utf8_validation: Utf8Validation::Verify,
+                json_format: JsonFormat::LegacyBestEffort,
+            },
+            Syntax::Proto3 => Self {
+                field_presence: FieldPresence::Implicit,
+                enum_type: EnumType::Open,
+                repeated_field_encoding: RepeatedFieldEncoding::Packed,
+                message_encoding: MessageEncoding::LengthPrefixed,
+                utf8_validation: Utf8Validation::Verify,
+                json_format: JsonFormat::Allow,
+            },
+            Syntax::Edition2023 => Self {
+                field_presence: FieldPresence::Explicit,
+                enum_type: EnumType::Open,
+                repeated_field_encoding: RepeatedFieldEncoding::Packed,
+                message_encoding: MessageEncoding::LengthPrefixed,
+                utf8_validation: Utf8Validation::Verify,
+                json_format: JsonFormat::Allow,
+            },
+        }
+    }
 }
 /// Declared occurrence rule for a protobuf field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -438,6 +560,8 @@ pub struct Field {
     pub default: Option<String>,
     /// Source options retained in declaration order.
     pub options: Vec<OptionSetting>,
+    /// Fully inherited feature values controlling this field's semantics.
+    pub features: FeatureSet,
 }
 /// Runtime descriptor for one protobuf message declaration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -448,10 +572,14 @@ pub struct MessageDescriptor {
     pub full_name: String,
     /// Fields in declaration order.
     pub fields: Vec<Field>,
+    /// Inclusive numeric ranges in which extension fields may be declared.
+    pub extension_ranges: Vec<(u32, u32)>,
     /// Oneof declarations in source order, including their options.
     pub oneofs: Vec<OneofDescriptor>,
     /// Message options retained for reflection and semantic auditing.
     pub options: Vec<OptionSetting>,
+    /// Fully inherited feature values controlling this message.
+    pub features: FeatureSet,
 }
 impl MessageDescriptor {
     /// Finds a field descriptor by its numeric protobuf tag.
@@ -461,6 +589,12 @@ impl MessageDescriptor {
     /// Finds a field descriptor by its source-level protobuf name.
     pub fn field_by_name(&self, name: &str) -> Option<&Field> {
         self.fields.iter().find(|field| field.name == name)
+    }
+}
+impl Field {
+    /// Returns the protobuf JSON name, honoring an explicit `json_name` option.
+    pub fn json_name(&self) -> String {
+        field_json_name(self)
     }
 }
 /// One named numeric member of a protobuf enumeration.
@@ -486,6 +620,8 @@ pub struct Enum {
     pub syntax: Syntax,
     /// Enum options retained for reflection and semantic auditing.
     pub options: Vec<OptionSetting>,
+    /// Fully inherited feature values controlling this enum.
+    pub features: FeatureSet,
 }
 /// One source-level protobuf option after lexical normalization.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -557,6 +693,16 @@ pub struct CustomOptionDescriptor {
     /// Field metadata describing the option's value and cardinality.
     pub field: Field,
 }
+/// Typed field declared outside its extended message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionDescriptor {
+    /// Package- and scope-qualified extension field name.
+    pub full_name: String,
+    /// Fully resolved message receiving this extension.
+    pub extendee: String,
+    /// Resolved field metadata used by the dynamic codec.
+    pub field: Field,
+}
 /// Import modifier attached to a protobuf import declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportKind {
@@ -590,10 +736,14 @@ pub struct Schema {
     pub services: BTreeMap<String, ServiceDescriptor>,
     /// Custom option extensions indexed by fully qualified extension name.
     pub custom_options: BTreeMap<String, CustomOptionDescriptor>,
+    /// Ordinary typed extensions indexed by qualified extension name.
+    pub extensions: BTreeMap<String, ExtensionDescriptor>,
     /// Import declarations collected from all reachable sources.
     pub imports: Vec<Import>,
     /// Root-file options retained for reflection and semantic auditing.
     pub options: Vec<OptionSetting>,
+    /// Resolved root-file feature values.
+    pub features: FeatureSet,
 }
 
 /// An allocation-backed collection of named `.proto` sources.
@@ -656,6 +806,35 @@ impl Registry {
     }
 }
 impl Schema {
+    /// Finds a regular or typed extension field by message and numeric tag.
+    pub fn field_by_number<'a>(
+        &'a self,
+        message: &'a MessageDescriptor,
+        number: u32,
+    ) -> Option<&'a Field> {
+        message.field_by_number(number).or_else(|| {
+            self.extensions
+                .values()
+                .find(|extension| {
+                    extension.extendee == message.full_name && extension.field.number == number
+                })
+                .map(|extension| &extension.field)
+        })
+    }
+
+    /// Iterates regular fields followed by typed extensions for a message.
+    pub fn fields_for<'a>(
+        &'a self,
+        message: &'a MessageDescriptor,
+    ) -> impl Iterator<Item = &'a Field> {
+        message.fields.iter().chain(
+            self.extensions
+                .values()
+                .filter(move |extension| extension.extendee == message.full_name)
+                .map(|extension| &extension.field),
+        )
+    }
+
     /// Looks up a message by fully qualified name or by this schema's package.
     ///
     /// Exact full-name lookup is attempted first. If it fails and the root
@@ -816,6 +995,8 @@ struct DescriptorBuilder {
     services: BTreeMap<String, ServiceDescriptor>,
     /// Custom option extensions accumulated by fully qualified name.
     custom_options: BTreeMap<String, CustomOptionDescriptor>,
+    /// Ordinary message extensions accumulated by qualified field name.
+    extensions: BTreeMap<String, ExtensionDescriptor>,
     /// Import declarations retained for registry graph traversal.
     imports: Vec<Import>,
     /// File options retained in source order.
@@ -926,29 +1107,6 @@ impl DescriptorBuilder {
         } else {
             format!("{scope}.{name}")
         }
-    }
-    /// Skips an unsupported declaration through its balanced body or semicolon.
-    fn skip_declaration(&mut self) -> Result<()> {
-        let mut depth = 0;
-        while self.cursor < self.tokens.len() {
-            match self.tokens[self.cursor].0 {
-                Token::Symbol('{') => depth += 1,
-                Token::Symbol('}') if depth == 0 => break,
-                Token::Symbol('}') if depth == 1 => {
-                    self.cursor += 1;
-                    self.consume_symbol(';');
-                    return Ok(());
-                }
-                Token::Symbol('}') => depth -= 1,
-                Token::Symbol(';') if depth == 0 => {
-                    self.cursor += 1;
-                    return Ok(());
-                }
-                _ => {}
-            }
-            self.cursor += 1
-        }
-        Err(Error::new(self.offset(), "unterminated declaration"))
     }
     /// Consumes a scalar field-option value in identifier, string, or numeric form.
     fn option_value(&mut self) -> Result<String> {
@@ -1061,12 +1219,20 @@ impl DescriptorBuilder {
         let names = matches!(
             self.tokens.get(self.cursor),
             Some((Token::StringLiteral(_), _))
-        );
+        ) || (self.syntax.is_edition()
+            && matches!(
+                self.tokens.get(self.cursor),
+                Some((Token::Identifier(_), _))
+            ));
         loop {
             if names {
                 let offset = self.offset();
                 let name = match self.tokens.get(self.cursor).cloned() {
                     Some((Token::StringLiteral(name), _)) => {
+                        self.cursor += 1;
+                        name
+                    }
+                    Some((Token::Identifier(name), _)) if self.syntax.is_edition() => {
                         self.cursor += 1;
                         name
                     }
@@ -1197,7 +1363,9 @@ impl DescriptorBuilder {
                 "enum must declare at least one value",
             ));
         }
-        if self.syntax == Syntax::Proto3 && values.first().is_some_and(|value| value.number != 0) {
+        if self.syntax.has_modern_defaults()
+            && values.first().is_some_and(|value| value.number != 0)
+        {
             return Err(Error::new(
                 self.offset(),
                 "first proto3 enum value must be zero",
@@ -1244,6 +1412,7 @@ impl DescriptorBuilder {
                 values,
                 syntax: self.syntax,
                 options,
+                features: FeatureSet::for_syntax(self.syntax),
             },
         );
         Ok(())
@@ -1260,6 +1429,7 @@ impl DescriptorBuilder {
         let mut fields = Vec::new();
         let mut oneofs = Vec::<OneofDescriptor>::new();
         let mut reserved = ReservedDeclarations::default();
+        let mut extension_ranges = Vec::new();
         let mut options = Vec::new();
         while !self.consume_symbol('}') {
             if self.consume_symbol(';') {
@@ -1308,24 +1478,40 @@ impl DescriptorBuilder {
                 options.push(self.option_declaration()?);
                 continue;
             }
-            if self.peek_identifier(KW_EXTEND) && self.syntax == Syntax::Proto3 {
+            if self.peek_identifier(KW_EXTEND) {
                 self.parse_custom_option_extensions(&full_name)?;
                 continue;
             }
-            if self.peek_identifier(KW_EXTENSIONS) || self.peek_identifier(KW_EXTEND) {
+            if self.peek_identifier(KW_EXTENSIONS) {
                 if self.syntax == Syntax::Proto3 {
                     return Err(Error::new(
                         self.offset(),
                         "proto3 extensions are permitted only for custom options",
                     ));
                 }
-                self.skip_declaration()?;
+                let declaration =
+                    self.parse_reserved(i64::from(MIN_FIELD_NUMBER), i64::from(MAX_FIELD_NUMBER))?;
+                for (start, end) in declaration.ranges {
+                    extension_ranges.push((start as u32, end as u32));
+                }
                 continue;
             }
             let cardinality = if self.peek_identifier(KW_REQUIRED) {
+                if self.syntax.is_edition() {
+                    return Err(Error::new(
+                        self.offset(),
+                        "required labels are not used in Editions",
+                    ));
+                }
                 self.identifier()?;
                 Some(Cardinality::Required)
             } else if self.peek_identifier(KW_OPTIONAL) {
+                if self.syntax.is_edition() {
+                    return Err(Error::new(
+                        self.offset(),
+                        "optional labels are not used in Editions",
+                    ));
+                }
                 self.identifier()?;
                 Some(Cardinality::Optional)
             } else if self.peek_identifier(KW_REPEATED) {
@@ -1348,7 +1534,7 @@ impl DescriptorBuilder {
         }
         let oneof_names: Vec<String> = oneofs.iter().map(|oneof| oneof.name.clone()).collect();
         validate_message_fields(&fields, &oneof_names, &reserved, self.offset())?;
-        if self.syntax == Syntax::Proto3 {
+        if self.syntax.has_modern_defaults() {
             validate_json_field_names(&fields, self.offset())?;
         }
         if self.messages.contains_key(&full_name) || self.enums.contains_key(&full_name) {
@@ -1360,19 +1546,22 @@ impl DescriptorBuilder {
                 name,
                 full_name,
                 fields,
+                extension_ranges,
                 oneofs,
                 options,
+                features: FeatureSet::for_syntax(self.syntax),
             },
         );
         Ok(())
     }
 
-    /// Parses proto3 extensions used exclusively to define custom options.
+    /// Parses custom-option or ordinary typed extension declarations.
     fn parse_custom_option_extensions(&mut self, scope: &str) -> Result<()> {
         self.identifier()?;
         let extendee = self.identifier()?;
         let extendee = extendee.trim_start_matches('.').to_string();
-        if !is_custom_option_extendee(&extendee) {
+        let custom_option = is_custom_option_extendee(&extendee);
+        if !custom_option && self.syntax == Syntax::Proto3 {
             return Err(Error::new(
                 self.offset(),
                 "proto3 extend target must be a descriptor options message",
@@ -1384,46 +1573,79 @@ impl DescriptorBuilder {
                 continue;
             }
             let cardinality = if self.peek_identifier(KW_OPTIONAL) {
+                if self.syntax.is_edition() {
+                    return Err(Error::new(
+                        self.offset(),
+                        "optional labels are not used in Editions",
+                    ));
+                }
                 self.identifier()?;
                 Cardinality::Optional
             } else if self.peek_identifier(KW_REPEATED) {
                 self.identifier()?;
                 Cardinality::Repeated
             } else if self.peek_identifier(KW_REQUIRED) {
-                return Err(Error::new(
-                    self.offset(),
-                    "required custom options are not allowed in proto3",
-                ));
+                if self.syntax.has_modern_defaults() {
+                    return Err(Error::new(
+                        self.offset(),
+                        "required extension fields are not allowed here",
+                    ));
+                }
+                self.identifier()?;
+                Cardinality::Required
             } else {
                 Cardinality::Optional
             };
-            let field = self.parse_field(None, Some(cardinality))?;
-            if field.number < CUSTOM_OPTION_MIN_FIELD_NUMBER {
+            if self.peek_identifier(KW_GROUP) {
+                self.skip_group()?;
+                continue;
+            }
+            let mut field = self.parse_field(None, Some(cardinality))?;
+            if custom_option && field.number < CUSTOM_OPTION_MIN_FIELD_NUMBER {
                 return Err(Error::new(
                     self.offset(),
                     "custom option number is outside the descriptor extension range",
                 ));
             }
             let full_name = self.qualify(scope, &field.name);
-            if self.custom_options.contains_key(&full_name)
-                || self.custom_options.values().any(|option| {
-                    option.extendee == extendee && option.field.number == field.number
-                })
+            if custom_option
+                && (self.custom_options.contains_key(&full_name)
+                    || self.custom_options.values().any(|option| {
+                        option.extendee == extendee && option.field.number == field.number
+                    }))
             {
                 return Err(Error::new(
                     self.offset(),
                     "duplicate custom option name or number",
                 ));
             }
-            self.custom_options.insert(
-                full_name.clone(),
-                CustomOptionDescriptor {
-                    name: field.name.clone(),
-                    full_name,
-                    extendee: extendee.clone(),
-                    field,
-                },
-            );
+            if custom_option {
+                self.custom_options.insert(
+                    full_name.clone(),
+                    CustomOptionDescriptor {
+                        name: field.name.clone(),
+                        full_name,
+                        extendee: extendee.clone(),
+                        field,
+                    },
+                );
+            } else {
+                if self.extensions.contains_key(&full_name) {
+                    return Err(Error::new(
+                        self.offset(),
+                        "duplicate extension name or number",
+                    ));
+                }
+                field.name = full_name.clone();
+                self.extensions.insert(
+                    full_name.clone(),
+                    ExtensionDescriptor {
+                        full_name,
+                        extendee: extendee.clone(),
+                        field,
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -1544,7 +1766,8 @@ impl DescriptorBuilder {
                 "proto2 field requires a cardinality label",
             ));
         }
-        if self.syntax == Syntax::Proto3 && declared_cardinality == Some(Cardinality::Required) {
+        if self.syntax.has_modern_defaults() && declared_cardinality == Some(Cardinality::Required)
+        {
             return Err(Error::new(
                 self.offset(),
                 "required fields are not allowed in proto3",
@@ -1669,7 +1892,7 @@ impl DescriptorBuilder {
                 FieldType::String | FieldType::Bytes | FieldType::Map(..)
             )
         {
-            packed = Some(self.syntax == Syntax::Proto3);
+            packed = Some(self.syntax.has_modern_defaults());
         }
         Ok(Field {
             name,
@@ -1682,6 +1905,7 @@ impl DescriptorBuilder {
             explicit_presence,
             default,
             options,
+            features: FeatureSet::for_syntax(self.syntax),
         })
     }
     /// Parses a built-in scalar type or records a user-defined type for resolution.
@@ -1766,6 +1990,17 @@ enum BuiltinOptionType {
 /// Returns the type of a built-in option valid at the supplied scope.
 fn builtin_option_type(target: OptionTarget, name: &str) -> Option<BuiltinOptionType> {
     use BuiltinOptionType::{Any, AnyScalar, Bool, Identifier, String as StringOption};
+    if matches!(
+        name,
+        FEATURE_FIELD_PRESENCE
+            | FEATURE_ENUM_TYPE
+            | FEATURE_REPEATED_ENCODING
+            | FEATURE_MESSAGE_ENCODING
+            | FEATURE_UTF8_VALIDATION
+            | FEATURE_JSON_FORMAT
+    ) {
+        return Some(Identifier);
+    }
     match target {
         OptionTarget::File => match name {
             "java_package"
@@ -1831,6 +2066,260 @@ fn builtin_option_type(target: OptionTarget, name: &str) -> Option<BuiltinOption
             _ => None,
         },
     }
+}
+
+/// Applies built-in Edition feature overrides to an inherited feature set.
+fn apply_feature_options(
+    inherited: FeatureSet,
+    options: &[OptionSetting],
+    target: OptionTarget,
+    edition: bool,
+) -> Result<FeatureSet> {
+    let mut features = inherited;
+    for option in options {
+        let recognized = match option.name.as_str() {
+            FEATURE_FIELD_PRESENCE => {
+                if !matches!(
+                    target,
+                    OptionTarget::File | OptionTarget::Message | OptionTarget::Field
+                ) {
+                    return Err(Error::new(0, "field_presence feature is misplaced"));
+                }
+                features.field_presence = match option.value.as_str() {
+                    "EXPLICIT" => FieldPresence::Explicit,
+                    "IMPLICIT" => FieldPresence::Implicit,
+                    "LEGACY_REQUIRED" => FieldPresence::LegacyRequired,
+                    _ => return Err(Error::new(0, "invalid field_presence feature value")),
+                };
+                true
+            }
+            FEATURE_ENUM_TYPE => {
+                if !matches!(target, OptionTarget::File | OptionTarget::Enum) {
+                    return Err(Error::new(0, "enum_type feature is misplaced"));
+                }
+                features.enum_type = match option.value.as_str() {
+                    "OPEN" => EnumType::Open,
+                    "CLOSED" => EnumType::Closed,
+                    _ => return Err(Error::new(0, "invalid enum_type feature value")),
+                };
+                true
+            }
+            FEATURE_REPEATED_ENCODING => {
+                if !matches!(target, OptionTarget::File | OptionTarget::Field) {
+                    return Err(Error::new(
+                        0,
+                        "repeated_field_encoding feature is misplaced",
+                    ));
+                }
+                features.repeated_field_encoding = match option.value.as_str() {
+                    "PACKED" => RepeatedFieldEncoding::Packed,
+                    "EXPANDED" => RepeatedFieldEncoding::Expanded,
+                    _ => {
+                        return Err(Error::new(
+                            0,
+                            "invalid repeated_field_encoding feature value",
+                        ));
+                    }
+                };
+                true
+            }
+            FEATURE_MESSAGE_ENCODING => {
+                if !matches!(target, OptionTarget::File | OptionTarget::Field) {
+                    return Err(Error::new(0, "message_encoding feature is misplaced"));
+                }
+                features.message_encoding = match option.value.as_str() {
+                    "LENGTH_PREFIXED" => MessageEncoding::LengthPrefixed,
+                    "DELIMITED" => MessageEncoding::Delimited,
+                    _ => return Err(Error::new(0, "invalid message_encoding feature value")),
+                };
+                true
+            }
+            FEATURE_UTF8_VALIDATION => {
+                if !matches!(target, OptionTarget::File | OptionTarget::Field) {
+                    return Err(Error::new(0, "utf8_validation feature is misplaced"));
+                }
+                features.utf8_validation = match option.value.as_str() {
+                    "VERIFY" => Utf8Validation::Verify,
+                    "NONE" => Utf8Validation::None,
+                    _ => return Err(Error::new(0, "invalid utf8_validation feature value")),
+                };
+                true
+            }
+            FEATURE_JSON_FORMAT => {
+                if !matches!(
+                    target,
+                    OptionTarget::File | OptionTarget::Message | OptionTarget::Enum
+                ) {
+                    return Err(Error::new(0, "json_format feature is misplaced"));
+                }
+                features.json_format = match option.value.as_str() {
+                    "ALLOW" => JsonFormat::Allow,
+                    "LEGACY_BEST_EFFORT" => JsonFormat::LegacyBestEffort,
+                    _ => return Err(Error::new(0, "invalid json_format feature value")),
+                };
+                true
+            }
+            _ => false,
+        };
+        if recognized && !edition {
+            return Err(Error::new(
+                0,
+                "features are available only in Editions sources",
+            ));
+        }
+    }
+    Ok(features)
+}
+
+/// Resolves file and lexical descriptor feature inheritance.
+fn resolve_features(schema: &mut Schema) -> Result<()> {
+    let edition = schema.syntax.is_edition();
+    let root = apply_feature_options(
+        FeatureSet::for_syntax(schema.syntax),
+        &schema.options,
+        OptionTarget::File,
+        edition,
+    )?;
+    schema.features = root;
+    let message_names: Vec<String> = schema.messages.keys().cloned().collect();
+    let mut resolved_messages = BTreeMap::<String, FeatureSet>::new();
+    for name in &message_names {
+        let parent = message_names
+            .iter()
+            .filter(|candidate| {
+                name.starts_with(candidate.as_str()) && name.as_str() != candidate.as_str()
+            })
+            .filter(|candidate| name.as_bytes().get(candidate.len()) == Some(&b'.'))
+            .max_by_key(|candidate| candidate.len())
+            .and_then(|candidate| resolved_messages.get(candidate))
+            .copied()
+            .unwrap_or(root);
+        let descriptor = schema
+            .messages
+            .get_mut(name)
+            .ok_or_else(|| Error::new(0, "message disappeared during feature resolution"))?;
+        descriptor.features =
+            apply_feature_options(parent, &descriptor.options, OptionTarget::Message, edition)?;
+        for field in &mut descriptor.fields {
+            field.features = apply_feature_options(
+                descriptor.features,
+                &field.options,
+                OptionTarget::Field,
+                edition,
+            )?;
+            if field.features.message_encoding == MessageEncoding::Delimited
+                && !matches!(field.kind, FieldType::Message(_))
+                && field
+                    .options
+                    .iter()
+                    .any(|option| option.name == FEATURE_MESSAGE_ENCODING)
+            {
+                return Err(Error::new(
+                    0,
+                    format!(
+                        "field {} applies DELIMITED encoding to a non-message",
+                        field.name
+                    ),
+                ));
+            }
+            if field
+                .options
+                .iter()
+                .any(|option| option.name == FEATURE_UTF8_VALIDATION)
+                && !matches!(field.kind, FieldType::String)
+            {
+                return Err(Error::new(
+                    0,
+                    format!(
+                        "field {} applies UTF-8 validation to a non-string",
+                        field.name
+                    ),
+                ));
+            }
+            if field
+                .options
+                .iter()
+                .any(|option| option.name == FEATURE_REPEATED_ENCODING)
+                && field.cardinality != Cardinality::Repeated
+            {
+                return Err(Error::new(
+                    0,
+                    format!(
+                        "field {} applies repeated encoding to a singular field",
+                        field.name
+                    ),
+                ));
+            }
+            field.explicit_presence = field.explicit_presence
+                || field.oneof.is_some()
+                || matches!(field.kind, FieldType::Message(_))
+                || field.features.field_presence != FieldPresence::Implicit;
+            if field.default.is_some() && field.features.field_presence == FieldPresence::Implicit {
+                return Err(Error::new(
+                    0,
+                    format!(
+                        "field {} cannot combine implicit presence with a default",
+                        field.name
+                    ),
+                ));
+            }
+            if field.cardinality == Cardinality::Repeated
+                && !field.packed_explicit
+                && !matches!(
+                    field.kind,
+                    FieldType::String
+                        | FieldType::Bytes
+                        | FieldType::Message(_)
+                        | FieldType::Map(..)
+                )
+            {
+                field.packed =
+                    Some(field.features.repeated_field_encoding == RepeatedFieldEncoding::Packed);
+            }
+        }
+        resolved_messages.insert(name.clone(), descriptor.features);
+    }
+    for enumeration in schema.enums.values_mut() {
+        let parent = message_names
+            .iter()
+            .filter(|candidate| enumeration.full_name.starts_with(candidate.as_str()))
+            .filter(|candidate| {
+                enumeration.full_name.as_bytes().get(candidate.len()) == Some(&b'.')
+            })
+            .max_by_key(|candidate| candidate.len())
+            .and_then(|candidate| resolved_messages.get(candidate))
+            .copied()
+            .unwrap_or(root);
+        enumeration.features =
+            apply_feature_options(parent, &enumeration.options, OptionTarget::Enum, edition)?;
+    }
+    for extension in schema.extensions.values_mut() {
+        let scope = extension
+            .full_name
+            .rsplit_once('.')
+            .map_or("", |(parent, _)| parent);
+        let inherited = resolved_messages.get(scope).copied().unwrap_or(root);
+        extension.field.features = apply_feature_options(
+            inherited,
+            &extension.field.options,
+            OptionTarget::Field,
+            edition,
+        )?;
+        extension.field.explicit_presence = extension.field.cardinality != Cardinality::Repeated
+            && extension.field.features.field_presence != FieldPresence::Implicit;
+        if extension.field.cardinality == Cardinality::Repeated
+            && !extension.field.packed_explicit
+            && !matches!(
+                extension.field.kind,
+                FieldType::String | FieldType::Bytes | FieldType::Message(_) | FieldType::Map(..)
+            )
+        {
+            extension.field.packed = Some(
+                extension.field.features.repeated_field_encoding == RepeatedFieldEncoding::Packed,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Validates built-in option names, scopes, scalar categories, and duplicates.
@@ -2239,33 +2728,41 @@ fn parse_file(source: &str) -> Result<Schema> {
         enums: BTreeMap::new(),
         services: BTreeMap::new(),
         custom_options: BTreeMap::new(),
+        extensions: BTreeMap::new(),
         imports: Vec::new(),
         options: Vec::new(),
     };
-    let mut seen_syntax = false;
+    let mut seen_language = false;
     let mut seen_package = false;
     let mut seen_non_syntax = false;
     while parser.cursor < parser.tokens.len() {
-        if parser.peek_identifier(KW_SYNTAX) {
-            if seen_syntax || seen_non_syntax {
+        if parser.peek_identifier(KW_SYNTAX) || parser.peek_identifier(KW_EDITION) {
+            if seen_language || seen_non_syntax {
                 return Err(Error::new(
                     parser.offset(),
-                    "syntax declaration must occur once at the start of the file",
+                    "syntax or edition declaration must occur once at the start of the file",
                 ));
             }
-            seen_syntax = true;
-            parser.identifier()?;
+            seen_language = true;
+            let declaration = parser.identifier()?;
             parser.expect_symbol('=')?;
-            let syntax_name = match parser.tokens.get(parser.cursor).cloned() {
+            let language_name = match parser.tokens.get(parser.cursor).cloned() {
                 Some((Token::StringLiteral(value), _)) => {
                     parser.cursor += 1;
                     value
                 }
-                _ => return Err(Error::new(parser.offset(), "expected syntax string")),
+                _ => {
+                    return Err(Error::new(
+                        parser.offset(),
+                        "expected language version string",
+                    ));
+                }
             };
-            parser.syntax = match syntax_name.as_str() {
-                SYNTAX_PROTO2 => Syntax::Proto2,
-                SYNTAX_PROTO3 => Syntax::Proto3,
+            parser.syntax = match (declaration.as_str(), language_name.as_str()) {
+                (KW_SYNTAX, SYNTAX_PROTO2) => Syntax::Proto2,
+                (KW_SYNTAX, SYNTAX_PROTO3) => Syntax::Proto3,
+                (KW_EDITION, EDITION_2023) => Syntax::Edition2023,
+                (KW_EDITION, _) => return Err(Error::new(parser.offset(), "unsupported edition")),
                 _ => return Err(Error::new(parser.offset(), "unsupported syntax")),
             };
             parser.expect_symbol(';')?
@@ -2314,11 +2811,7 @@ fn parse_file(source: &str) -> Result<Schema> {
             parser.options.push(option)
         } else if parser.peek_identifier(KW_EXTEND) {
             seen_non_syntax = true;
-            if parser.syntax == Syntax::Proto3 {
-                parser.parse_custom_option_extensions("")?
-            } else {
-                parser.skip_declaration()?
-            }
+            parser.parse_custom_option_extensions("")?
         } else if parser.consume_symbol(';') {
             seen_non_syntax = true;
         } else {
@@ -2335,8 +2828,10 @@ fn parse_file(source: &str) -> Result<Schema> {
         enums: parser.enums,
         services: parser.services,
         custom_options: parser.custom_options,
+        extensions: parser.extensions,
         imports: parser.imports,
         options: parser.options,
+        features: FeatureSet::for_syntax(parser.syntax),
     })
 }
 
@@ -2369,7 +2864,12 @@ fn parse_registry(root: &str, registry: &Registry) -> Result<Schema> {
         let source = registry
             .source(&path)
             .ok_or_else(|| Error::new(0, format!("import not found: {path}")))?;
-        let file = parse_file(source)?;
+        let file = parse_file(source).map_err(|error| {
+            Error::new(
+                error.offset,
+                format!("while parsing registry source {path}: {}", error.message),
+            )
+        })?;
         for import in &file.imports {
             if registry.source(&import.path).is_none() {
                 if import.kind == ImportKind::Weak {
@@ -2408,6 +2908,7 @@ fn parse_registry(root: &str, registry: &Registry) -> Result<Schema> {
             .ok_or_else(|| Error::new(0, "registered source disappeared"))?;
         validate_symbol_namespaces(file)?;
         resolve_schema_declarations(file, &visible_messages, &visible_enums)?;
+        resolve_features(file)?;
     }
     for path in &paths {
         let visible_paths = visibility
@@ -2457,6 +2958,17 @@ fn parse_registry(root: &str, registry: &Registry) -> Result<Schema> {
                 return Err(Error::new(0, format!("duplicate custom option: {name}")));
             }
             schema.custom_options.insert(name, option);
+        }
+        for (name, extension) in file.extensions {
+            if schema.extensions.contains_key(&name)
+                || schema.extensions.values().any(|existing| {
+                    existing.extendee == extension.extendee
+                        && existing.field.number == extension.field.number
+                })
+            {
+                return Err(Error::new(0, format!("duplicate extension: {name}")));
+            }
+            schema.extensions.insert(name, extension);
         }
         schema.imports.extend(file.imports);
     }
@@ -2535,6 +3047,7 @@ fn resolve_schema(schema: &mut Schema) -> Result<()> {
         .map(|(name, enumeration)| (name.clone(), enumeration.syntax))
         .collect();
     resolve_schema_declarations(schema, &messages, &enums)?;
+    resolve_features(schema)?;
     let resolved_messages = schema.messages.clone();
     let custom_options = schema.custom_options.clone();
     validate_schema_options(schema, &custom_options, &resolved_messages)
@@ -2556,7 +3069,7 @@ fn resolve_schema_declarations(
                 &message_names,
                 &enum_names,
             )?;
-            if schema.syntax == Syntax::Proto3 {
+            if schema.syntax.has_modern_defaults() {
                 reject_proto2_enum_reference(&field.kind, enums)?;
             }
             if field.packed_explicit
@@ -2611,6 +3124,62 @@ fn resolve_schema_declarations(
             .map_or("", |(parent, _)| parent);
         resolve(&mut option.field.kind, scope, &message_names, &enum_names)?;
         validate_options(&option.field.options, OptionTarget::Field)?;
+    }
+    for extension in schema.extensions.values_mut() {
+        let mut extendee_type = FieldType::Message(extension.extendee.clone());
+        let scope = extension
+            .full_name
+            .rsplit_once('.')
+            .map_or("", |(parent, _)| parent);
+        resolve(&mut extendee_type, scope, &message_names, &enum_names)?;
+        let FieldType::Message(extendee) = extendee_type else {
+            return Err(Error::new(0, "extension target must be a message"));
+        };
+        let target = messages
+            .get(&extendee)
+            .ok_or_else(|| Error::new(0, "extension target is not visible"))?;
+        if !target
+            .extension_ranges
+            .iter()
+            .any(|(start, end)| (*start..=*end).contains(&extension.field.number))
+        {
+            return Err(Error::new(
+                0,
+                format!(
+                    "extension {} is outside the target's extension ranges",
+                    extension.full_name
+                ),
+            ));
+        }
+        if target.field_by_number(extension.field.number).is_some() {
+            return Err(Error::new(
+                0,
+                "extension number collides with a regular field",
+            ));
+        }
+        extension.extendee = extendee;
+        resolve(
+            &mut extension.field.kind,
+            scope,
+            &message_names,
+            &enum_names,
+        )?;
+        validate_options(&extension.field.options, OptionTarget::Field)?;
+    }
+    let extensions: Vec<&ExtensionDescriptor> = schema.extensions.values().collect();
+    for (index, extension) in extensions.iter().enumerate() {
+        if extensions[..index].iter().any(|previous| {
+            previous.extendee == extension.extendee
+                && previous.field.number == extension.field.number
+        }) {
+            return Err(Error::new(
+                0,
+                format!(
+                    "duplicate extension number {} for {}",
+                    extension.field.number, extension.extendee
+                ),
+            ));
+        }
     }
     for service in schema.services.values_mut() {
         for method in &mut service.methods {

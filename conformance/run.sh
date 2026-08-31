@@ -87,5 +87,6 @@ cd "$project_dir"
 cargo build --example conformance_testee
 "$runner" \
   --enforce_recommended \
+  --maximum_edition 2023 \
   "target/debug/examples/conformance_testee" \
   "$source_root"

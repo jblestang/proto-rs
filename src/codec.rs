@@ -33,7 +33,8 @@
 //! It represents strings, bytes, messages, packed fields, and map entries.
 //! Wire type five carries fixed-width little-endian 32-bit values.
 //! It represents `fixed32`, `sfixed32`, and `float`.
-//! Legacy group wire types three and four are intentionally unsupported.
+//! Wire types three and four carry unknown groups and Edition `DELIMITED`
+//! message fields; matching terminators and nesting are validated.
 //! A decoder never guesses a different type after a wire-type mismatch.
 //!
 //! # Dynamic values
@@ -42,7 +43,8 @@
 //! Signed fixed and zig-zag values share the signed integer variants.
 //! Unsigned and fixed unsigned values share the unsigned variants.
 //! Enums retain their numeric value, including unknown enum numbers.
-//! Strings are validated as UTF-8 while bytes remain opaque.
+//! Strings normally validate UTF-8; Edition fields selecting validation `NONE`
+//! use [`Value::RawString`] to preserve arbitrary payload bytes losslessly.
 //! Embedded messages recursively contain another [`Message`].
 //! Repeated values retain encounter order.
 //! Maps retain deterministic insertion order in a vector.
@@ -314,14 +316,15 @@
 //! The adapter uses this dynamic API rather than generated Rust messages.
 //! Proto3 binary required and recommended cases are exercised.
 //! Basic proto2 binary cases are exercised with known MessageSet exclusions.
-//! JSON and text-format requests are explicitly skipped by the adapter.
-//! Those formats are not silently treated as binary protobuf.
+//! Protobuf JSON requests use the descriptor-driven JSON module.
+//! Text-format and JSPB requests are explicitly skipped by the adapter.
 //! `CONFORMANCE.md` records every ignored or unsupported family.
 //! The vendored runner pins the upstream protobuf revision used for results.
 //! None of the host-only conformance machinery is linked into this library.
 
 use crate::{
-    Cardinality, Error, FieldType, MessageDescriptor, Result, Schema,
+    Cardinality, EnumType, Error, Field, FieldPresence, FieldType, MessageDescriptor,
+    MessageEncoding, Result, Schema, Utf8Validation,
     constants::{
         CANONICAL_F32_NAN_BITS, CANONICAL_F64_NAN_BITS, DEFAULT_RECURSION_LIMIT,
         FIELD_NUMBER_SHIFT, FIXED32_SIZE, FIXED64_SIZE, I32_SIGN_SHIFT, I64_SIGN_SHIFT,
@@ -357,6 +360,8 @@ pub enum Value {
     Bool(bool),
     /// UTF-8 string value.
     String(String),
+    /// String payload retained without UTF-8 validation under Editions.
+    RawString(Vec<u8>),
     /// Opaque byte-string value.
     Bytes(Vec<u8>),
     /// Numeric enum value, including values unknown to the schema.
@@ -855,6 +860,7 @@ fn compare_map_keys(kind: &FieldType, left: &Value, right: &Value) -> Ordering {
         }
         (FieldType::Bool, Value::Bool(left), Value::Bool(right)) => left.cmp(right),
         (FieldType::String, Value::String(left), Value::String(right)) => left.cmp(right),
+        (FieldType::String, Value::RawString(left), Value::RawString(right)) => left.cmp(right),
         _ => Ordering::Equal,
     }
 }
@@ -908,7 +914,7 @@ fn encode_inner(
             }
         }
     }
-    for f in &d.fields {
+    for f in s.fields_for(d) {
         if let Some(v) = m.get(&f.name) {
             if let FieldType::Map(key_type, value_type) = &f.kind {
                 let Value::Map(entries) = v else {
@@ -956,11 +962,39 @@ fn encode_inner(
                 o.extend(z)
             } else {
                 for x in xs {
-                    vi(make_key(f.number, wire(&f.kind)), &mut o);
-                    scalar(&f.kind, x, s, options, &mut o)?
+                    if matches!(f.kind, FieldType::Message(_))
+                        && f.features.message_encoding == MessageEncoding::Delimited
+                    {
+                        let (FieldType::Message(name), Value::Message(message)) = (&f.kind, x)
+                        else {
+                            return Err(Error::new(0, "value does not match message field type"));
+                        };
+                        let nested = s
+                            .message(name)
+                            .ok_or_else(|| Error::new(0, "unknown message type"))?;
+                        vi(make_key(f.number, WIRE_TYPE_START_GROUP), &mut o);
+                        o.extend(encode_inner(s, nested, message, options)?.bytes);
+                        vi(make_key(f.number, WIRE_TYPE_END_GROUP), &mut o);
+                    } else {
+                        vi(make_key(f.number, wire(&f.kind)), &mut o);
+                        if let (FieldType::String, Value::RawString(bytes)) = (&f.kind, x) {
+                            if f.features.utf8_validation != Utf8Validation::None {
+                                return Err(Error::new(
+                                    0,
+                                    "raw string requires utf8_validation = NONE",
+                                ));
+                            }
+                            vi(bytes.len() as u64, &mut o);
+                            o.extend(bytes);
+                        } else {
+                            scalar(&f.kind, x, s, options, &mut o)?
+                        }
+                    }
                 }
             }
-        } else if f.cardinality == Cardinality::Required {
+        } else if f.cardinality == Cardinality::Required
+            || f.features.field_presence == FieldPresence::LegacyRequired
+        {
             return Err(Error::new(0, "missing required field"));
         }
     }
@@ -990,7 +1024,7 @@ fn encode_inner(
         }
     }
     for name in m.fields.keys() {
-        if d.field_by_name(name).is_none() {
+        if !s.fields_for(d).any(|field| field.name == *name) {
             audit.push(AuditRecord {
                 tag: AuditTag::AddedField,
                 field_name: Some(name.clone()),
@@ -1050,6 +1084,7 @@ fn is_default(value: &Value) -> bool {
         Value::Uint64(value) => *value == 0,
         Value::Bool(value) => !*value,
         Value::String(value) => value.is_empty(),
+        Value::RawString(value) => value.is_empty(),
         Value::Bytes(value) => value.is_empty(),
         Value::Repeated(value) => value.is_empty(),
         Value::Map(value) => value.is_empty(),
@@ -1281,6 +1316,90 @@ fn val(
         }
         FieldType::Map(..) => return Err(Error::new(*p, "map codec not yet supported")),
     })
+}
+
+/// Locates a matching group terminator and returns its body without decoding it.
+fn delimited_message_body<'a>(
+    field_number: u32,
+    bytes: &'a [u8],
+    cursor: &mut usize,
+) -> Result<&'a [u8]> {
+    let body_start = *cursor;
+    let mut scan = *cursor;
+    loop {
+        if scan == bytes.len() {
+            return Err(Error::new(scan, "unterminated delimited message"));
+        }
+        let tag_start = scan;
+        let (nested_number, nested_wire_type) = read_key(bytes, &mut scan)?;
+        if nested_wire_type == WIRE_TYPE_END_GROUP {
+            if nested_number != field_number {
+                return Err(Error::new(scan, "mismatched delimited message terminator"));
+            }
+            *cursor = scan;
+            return bytes
+                .get(body_start..tag_start)
+                .ok_or_else(|| Error::new(body_start, "invalid delimited message bounds"));
+        }
+        skip(nested_number, nested_wire_type, bytes, &mut scan)?;
+    }
+}
+
+/// Decodes one field while honoring its resolved message-encoding feature.
+fn field_value(
+    field: &Field,
+    wire_type: u8,
+    bytes: &[u8],
+    cursor: &mut usize,
+    schema: &Schema,
+    context: &mut DecodeContext<'_>,
+    depth: usize,
+) -> Result<Value> {
+    if matches!(field.kind, FieldType::String)
+        && field.features.utf8_validation == Utf8Validation::None
+    {
+        if wire_type != WIRE_TYPE_LENGTH_DELIMITED {
+            return Err(Error::new(*cursor, "string has wrong wire type"));
+        }
+        let length = context.length(bytes, cursor)?;
+        return Ok(Value::RawString(take(bytes, cursor, length)?.to_vec()));
+    }
+    if field.features.message_encoding != MessageEncoding::Delimited
+        || !matches!(field.kind, FieldType::Message(_))
+    {
+        return val(
+            &field.kind,
+            wire_type,
+            bytes,
+            cursor,
+            schema,
+            context,
+            depth,
+        );
+    }
+    let FieldType::Message(name) = &field.kind else {
+        return Err(Error::new(
+            *cursor,
+            "DELIMITED message encoding requires a message field",
+        ));
+    };
+    if wire_type != WIRE_TYPE_START_GROUP {
+        return Err(Error::new(*cursor, "delimited message has wrong wire type"));
+    }
+    let body = delimited_message_body(field.number, bytes, cursor)?;
+    let nested = schema
+        .message(name)
+        .ok_or_else(|| Error::new(*cursor, "unknown message type"))?;
+    let nested_depth = depth
+        .checked_add(1)
+        .ok_or_else(|| Error::new(*cursor, "recursion depth overflow"))?;
+    Ok(Value::Message(decode_inner(
+        schema,
+        nested,
+        body,
+        context,
+        nested_depth,
+    )?))
 }
 
 /// Rejects lossy 64-to-32-bit varint truncation in strict decoding mode.
@@ -1544,7 +1663,7 @@ fn decode_inner(
         let field_start = p;
         context.count_field(field_start)?;
         let (n, w) = read_key_with_policy(b, &mut p, context.options.require_minimal_varints)?;
-        let Some(f) = d.field_by_number(n) else {
+        let Some(f) = s.field_by_number(d, n) else {
             let encoded_value = skip_decode(n, w, b, &mut p, context, depth)?;
             if context.options.unknown_fields == UnknownFieldPolicy::Reject {
                 return Err(Error::new(field_start, "unknown field rejected by policy"));
@@ -1636,6 +1755,49 @@ fn decode_inner(
             m.audit.push(record);
             continue;
         }
+        if let FieldType::Enum(name) = &f.kind
+            && w == WIRE_TYPE_VARINT
+            && s.enums
+                .get(name)
+                .is_some_and(|enumeration| enumeration.features.enum_type == EnumType::Closed)
+        {
+            let value_start = p;
+            let raw = context.varint(b, &mut p)?;
+            let value = raw as i32;
+            require_canonical_32_bit_varint(raw, value as i64 as u64, p, context)?;
+            let known = s.enums.get(name).is_some_and(|enumeration| {
+                enumeration
+                    .values
+                    .iter()
+                    .any(|candidate| candidate.number == value)
+            });
+            if !known {
+                if context.options.unknown_fields == UnknownFieldPolicy::Reject {
+                    return Err(Error::new(field_start, "closed enum value is unknown"));
+                }
+                if context.options.unknown_fields == UnknownFieldPolicy::Preserve {
+                    m.unknown_fields.push(UnknownField {
+                        number: f.number,
+                        wire_type: w,
+                        encoded_value: audit_bytes(b, value_start, p)?,
+                    });
+                }
+                let record = context.audit_record(
+                    b,
+                    field_start..p,
+                    AuditRecord {
+                        tag: AuditTag::UnknownField,
+                        field_name: Some(f.name.clone()),
+                        field_number: n,
+                        wire_type: w,
+                        encoded_field: Vec::new(),
+                    },
+                )?;
+                m.audit.push(record);
+                continue;
+            }
+            p = value_start;
+        }
         let repeated = f.cardinality == Cardinality::Repeated;
         let duplicate = !repeated
             && (m.fields.contains_key(&f.name)
@@ -1673,7 +1835,7 @@ fn decode_inner(
                         "repeated field exceeds configured value limit",
                     ));
                 }
-                xs.push(val(
+                let value = val(
                     &f.kind,
                     wire(&f.kind),
                     packed,
@@ -1681,7 +1843,31 @@ fn decode_inner(
                     s,
                     context,
                     depth,
-                )?)
+                )?;
+                if let (FieldType::Enum(name), Value::Enum(number)) = (&f.kind, &value)
+                    && s.enums.get(name).is_some_and(|enumeration| {
+                        enumeration.features.enum_type == EnumType::Closed
+                            && !enumeration
+                                .values
+                                .iter()
+                                .any(|candidate| candidate.number == *number)
+                    })
+                {
+                    if context.options.unknown_fields == UnknownFieldPolicy::Reject {
+                        return Err(Error::new(field_start, "closed enum value is unknown"));
+                    }
+                    if context.options.unknown_fields == UnknownFieldPolicy::Preserve {
+                        let mut encoded_value = Vec::new();
+                        vi(*number as i64 as u64, &mut encoded_value);
+                        m.unknown_fields.push(UnknownField {
+                            number: f.number,
+                            wire_type: WIRE_TYPE_VARINT,
+                            encoded_value,
+                        });
+                    }
+                } else {
+                    xs.push(value);
+                }
             }
             m.insert(f.name.clone(), Value::Repeated(xs));
             let record = context.audit_record(
@@ -1698,7 +1884,7 @@ fn decode_inner(
             m.audit.push(record);
             continue;
         }
-        let x = val(&f.kind, w, b, &mut p, s, context, depth)?;
+        let x = field_value(f, w, b, &mut p, s, context, depth)?;
         let mut merged = false;
         if repeated {
             if xs.len() >= context.options.max_repeated_values {
@@ -1769,8 +1955,11 @@ fn decode_inner(
         )?;
         m.audit.push(record);
     }
-    for f in &d.fields {
-        if f.cardinality == Cardinality::Required && !m.fields.contains_key(&f.name) {
+    for f in s.fields_for(d) {
+        if (f.cardinality == Cardinality::Required
+            || f.features.field_presence == FieldPresence::LegacyRequired)
+            && !m.fields.contains_key(&f.name)
+        {
             return Err(Error::new(0, "missing required field"));
         }
     }

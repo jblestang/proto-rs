@@ -16,9 +16,12 @@ does not require generated Rust types: messages are represented by generic
 ## Features
 
 - Proto2 and proto3 syntax declarations
+- Edition 2023 syntax with inherited standard feature resolution
 - Packages, nested messages, enums, oneofs, repeated and packed fields
 - Services and streaming RPC descriptors with resolved message endpoints
 - Retained and type-checked built-in and custom descriptor options
+- Typed extension ranges, declarations, Registry resolution, and wire handling
+- Protobuf JSON with well-known types, strict semantics, and no JSPB dependency
 - Dynamic maps with protobuf defaults and last-key-wins semantics
 - Transitive normal, public, and weak import resolution from in-memory sources
 - Syntax and semantic validation of identifiers, declarations, namespaces,
@@ -31,7 +34,8 @@ does not require generated Rust types: messages are represented by generic
 
 The library has no `std` feature and its Cargo default-feature set is empty.
 Its runtime data model uses `core` and `alloc`, and both Pest dependencies are
-built with `default-features = false`. Pest generates the parser for the
+and JSON dependencies are built with their standard-library features disabled.
+Pest generates the parser for the
 checked-in `src/proto.pest` grammar when this crate is compiled. User `.proto`
 files are always parsed into dynamic descriptors at runtime: they never
 generate Rust source, structs, or message-specific codecs. The conformance
@@ -45,7 +49,7 @@ The crates.io package is named `proto-rs-dynamic`; its Rust library name stays
 
 ```toml
 [dependencies]
-proto-rs-dynamic = "0.1"
+proto-rs-dynamic = "0.2"
 ```
 
 ```rust
@@ -62,6 +66,8 @@ message.insert("text", Value::String("hello".into()));
 
 let bytes = encode(&schema, greeting, &message)?;
 assert_eq!(decode(&schema, greeting, &bytes)?, message);
+let json = proto_rs::encode_json(&schema, greeting, &message)?;
+assert_eq!(proto_rs::decode_json(&schema, greeting, &json)?, message);
 # Ok::<(), proto_rs::Error>(())
 ```
 
@@ -114,14 +120,28 @@ official Protocol Buffers conformance test suite without generated Rust message
 code. Against protobuf v34.1, the strict (`--enforce_recommended`) run reports:
 
 ```text
-1414 successes, 1392 skipped, 0 expected failures, 0 unexpected failures
+5623 successes, 4 skipped, 0 expected failures, 0 unexpected failures
 ```
 
-This covers full proto3 binary behavior and basic proto2 binary behavior.
-JSON, text format, and Editions are intentionally ignored formats. Declared
-proto2 groups/extensions and MessageSet reflection remain outside the schema
-model, although all group- and MessageSet-shaped binary cases scheduled by the
-pinned suite now pass through safe unknown-wire preservation.
+This covers proto3, the supported proto2 tier, Edition 2023 binary behavior,
+typed extensions, and the official protobuf JSON mapping, including well-known
+types. The four skips are the deliberately unsupported JSPB requests. Text
+format remains outside the crate. Declared proto2 groups and MessageSet
+reflection remain outside the typed schema model, although scheduled binary
+cases pass through safe unknown-wire preservation.
+
+### Missing implementation features
+
+- Protocol Buffers text format: 883 intentionally skipped tests
+- JSPB: 4 intentionally skipped tests
+- Typed proto2 group declarations
+- MessageSet reflection
+- Editions newer than 2023 and unstable Editions
+
+These exclusions prevent an unrestricted claim of support for every Protocol
+Buffers format and edition. They do not hide failures in the enabled binary
+and protobuf JSON coverage.
+
 [CONFORMANCE.md](CONFORMANCE.md) explains exactly which tests pass, which are
 explicitly skipped, which are not scheduled, and what the suite does not
 prove. GitHub CI rebuilds the official runner from the commit in

@@ -285,9 +285,10 @@ The following items are not currently implemented:
   application protocol.
 - Semantic inspection of opaque `bytes` fields that themselves contain a
   serialized protobuf message.
-- Declared proto2 groups and extensions, MessageSet, Editions, JSON, and text
-  format. Unknown group wire values are supported even though group schema
-  declarations are not. Their status is tracked in
+- Declared proto2 groups, MessageSet, and text format. Typed extensions,
+  protobuf JSON, and Edition 2023's standard features are implemented, including
+  typed `DELIMITED` message fields. Unknown legacy group wire values are also
+  supported even though proto2 group declarations are not. Their status is tracked in
   [`CONFORMANCE.md`](CONFORMANCE.md).
 
 Protobuf serialization is not universally canonical. Do not use encoded bytes

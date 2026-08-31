@@ -1,4 +1,4 @@
-// Protocol Buffers proto2/proto3 grammar used for syntax validation.
+// Protocol Buffers proto2/proto3/Edition 2023 grammar used for validation.
 // Semantic constraints and import/type resolution remain in schema.rs.
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
@@ -6,7 +6,7 @@ COMMENT = _{ line_comment | block_comment }
 line_comment = _{ "//" ~ (!"\n" ~ ANY)* }
 block_comment = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
-proto_file = { SOI ~ syntax_decl? ~ file_item* ~ EOI }
+proto_file = { SOI ~ (syntax_decl | edition_decl)? ~ file_item* ~ EOI }
 token_stream = { SOI ~ lexical_token* ~ EOI }
 lexical_token = _{ string_literal | lex_number | lex_identifier | lex_symbol }
 lex_identifier = @{ "."? ~ ident_start ~ ident_continue* ~ ("." ~ ident_start ~ ident_continue*)* }
@@ -33,6 +33,7 @@ file_item = _{
 
 syntax_decl = { KW_SYNTAX ~ "=" ~ syntax_name ~ ";" }
 syntax_name = { string_literal }
+edition_decl = { KW_EDITION ~ "=" ~ string_literal ~ ";" }
 import_decl = { KW_IMPORT ~ (KW_WEAK | KW_PUBLIC)? ~ string_literal ~ ";" }
 package_decl = { KW_PACKAGE ~ full_ident ~ ";" }
 
@@ -73,7 +74,7 @@ enum_value_options = { "[" ~ enum_value_option ~ ("," ~ enum_value_option)* ~ "]
 enum_value_option = { option_name ~ "=" ~ constant }
 
 reserved_decl = { KW_RESERVED ~ (reserved_names | reserved_ranges) ~ ";" }
-reserved_names = { string_literal ~ ("," ~ string_literal)* }
+reserved_names = { (string_literal | identifier) ~ ("," ~ (string_literal | identifier))* }
 reserved_ranges = { range ~ ("," ~ range)* }
 extensions_decl = { KW_EXTENSIONS ~ range ~ ("," ~ range)* ~ ";" }
 range = { int_literal ~ (KW_TO ~ (int_literal | KW_MAX))? }
@@ -161,6 +162,7 @@ escape = _{
 empty_statement = { ";" }
 
 KW_SYNTAX = @{ "syntax" ~ !ident_continue }
+KW_EDITION = @{ "edition" ~ !ident_continue }
 KW_IMPORT = @{ "import" ~ !ident_continue }
 KW_WEAK = @{ "weak" ~ !ident_continue }
 KW_PUBLIC = @{ "public" ~ !ident_continue }

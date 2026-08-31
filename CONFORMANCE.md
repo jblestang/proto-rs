@@ -43,9 +43,9 @@ The following binary-wire areas are exercised and pass:
 The last verified result is:
 
 ```text
-Binary/JSON suite: 1414 successes, 1392 skipped, 0 expected failures,
+Binary/JSON suite: 5623 successes,    4 skipped, 0 expected failures,
                    0 unexpected failures
-Text suite:          0 successes,  434 skipped, 0 expected failures,
+Text suite:          0 successes,  883 skipped, 0 expected failures,
                    0 unexpected failures
 ```
 
@@ -54,28 +54,39 @@ Text suite:          0 successes,  434 skipped, 0 expected failures,
 "Ignored" does not mean that arbitrary failures are suppressed. Only the
 following known feature families are outside the supported conformance scope.
 
+### Missing implementation features
+
+- Protocol Buffers text format: 883 intentionally skipped tests
+- JSPB: 4 intentionally skipped tests
+- Typed proto2 group declarations
+- MessageSet reflection
+- Editions newer than 2023 and unstable Editions
+
 ### Tests scheduled but explicitly skipped by the adapter
 
-- **Protocol Buffers JSON:** JSON payloads and JSON output requests are
-  answered with `ConformanceResponse.skipped`. No JSON conformance case is
-  claimed as passing.
 - **Protocol Buffers text format:** Text payloads and text output requests are
   answered with `ConformanceResponse.skipped`. Consequently, the text suite's
-  434 cases are all reported as skipped.
+  883 cases are all reported as skipped.
 - **JSPB:** JSPB payload or output requests are answered as skipped. JSPB is an
   optional upstream format and is not part of the claimed binary coverage.
 
+### Supported Edition and JSON coverage
+
+Descriptor-driven protobuf JSON, including standard well-known-type mappings,
+is exercised by the binary/JSON suite. The runner is invoked with
+`--maximum_edition 2023`; all scheduled Edition 2023 binary and JSON cases
+pass.
+
 ### Tests not scheduled as supported coverage
 
-- **Declared proto2 groups, extensions, and MessageSet reflection:** The parser
-  does not expose descriptors for these legacy constructs. Nevertheless, every
+- **Declared proto2 groups and MessageSet reflection:** The parser does not
+  expose typed descriptors for these legacy constructs. Ordinary typed
+  extensions and extension ranges are supported. Nevertheless, every
   group- and MessageSet-shaped binary test scheduled by the pinned runner now
   passes through safe unknown-wire preservation. This result does not imply
-  typed extension lookup or MessageSet reflection support.
-- **Editions 2023 and unstable Editions:** The runner is not given a maximum
-  Editions level, because Editions syntax and feature resolution are not
-  implemented. If an Editions request is nevertheless received, the adapter
-  answers it as skipped.
+  typed group or MessageSet reflection support.
+- **Unstable and later Editions:** These are rejected as unsupported rather
+  than interpreted using Edition 2023 defaults.
 
 No failure list is passed to the runner, and the project does not maintain a
 list of expected failures. The only accepted non-success result is an explicit
