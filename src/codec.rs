@@ -327,9 +327,9 @@ use crate::{
         FIELD_NUMBER_SHIFT, FIXED32_SIZE, FIXED64_SIZE, I32_SIGN_SHIFT, I64_SIGN_SHIFT,
         MAP_KEY_FIELD_NUMBER, MAP_VALUE_FIELD_NUMBER, MAX_FIELD_KEY_BYTES, MAX_FIELD_NUMBER,
         MAX_TENTH_VARINT_BYTE, MAX_VARINT_BYTES, MIN_FIELD_NUMBER, VARINT_BITS_PER_BYTE,
-        VARINT_CONTINUATION_BIT, VARINT_DATA_MASK, WIRE_TYPE_FIXED32, WIRE_TYPE_FIXED64,
-        WIRE_TYPE_LENGTH_DELIMITED, WIRE_TYPE_MASK, WIRE_TYPE_VARINT, is_supported_wire_type,
-        make_key,
+        VARINT_CONTINUATION_BIT, VARINT_DATA_MASK, WIRE_TYPE_END_GROUP, WIRE_TYPE_FIXED32,
+        WIRE_TYPE_FIXED64, WIRE_TYPE_LENGTH_DELIMITED, WIRE_TYPE_MASK, WIRE_TYPE_START_GROUP,
+        WIRE_TYPE_VARINT, is_supported_wire_type, make_key,
     },
 };
 use alloc::{
@@ -965,7 +965,10 @@ fn encode_inner(
         }
     }
     for u in &m.unknown_fields {
-        let forward = if u.wire_type == WIRE_TYPE_LENGTH_DELIMITED {
+        let forward = if matches!(
+            u.wire_type,
+            WIRE_TYPE_LENGTH_DELIMITED | WIRE_TYPE_START_GROUP
+        ) {
             options.forward_unknown_messages
         } else {
             options.forward_unknown_fields
@@ -1026,7 +1029,7 @@ fn apply_field_order(bytes: &mut Vec<u8>, order: FieldOrder) -> Result<()> {
     while cursor < bytes.len() {
         let start = cursor;
         let (number, wire_type) = read_key(bytes, &mut cursor)?;
-        skip(wire_type, bytes, &mut cursor)?;
+        skip(number, wire_type, bytes, &mut cursor)?;
         occurrences.push((number, audit_bytes(bytes, start, cursor)?));
     }
     occurrences.sort_by_key(|(number, _)| *number);
@@ -1368,7 +1371,14 @@ fn decode_map_entry(
                 )?)
             }
             _ => {
-                skip_decode((tag & WIRE_TYPE_MASK) as u8, entry, &mut cursor, context)?;
+                skip_decode(
+                    tag as u32 >> FIELD_NUMBER_SHIFT,
+                    (tag & WIRE_TYPE_MASK) as u8,
+                    entry,
+                    &mut cursor,
+                    context,
+                    depth,
+                )?;
             }
         }
     }
@@ -1379,9 +1389,9 @@ fn decode_map_entry(
 }
 /// Skips one unknown wire value and returns its exact encoded value bytes.
 ///
-/// The returned bytes exclude the already-consumed field key. Unsupported
-/// group wire types and truncated values produce errors.
-fn skip(w: u8, b: &[u8], p: &mut usize) -> Result<Vec<u8>> {
+/// The returned bytes exclude the already-consumed field key. Groups include
+/// their matching end tag so an unknown occurrence can be forwarded exactly.
+fn skip(field_number: u32, w: u8, b: &[u8], p: &mut usize) -> Result<Vec<u8>> {
     let s = *p;
     match w {
         WIRE_TYPE_VARINT => {
@@ -1399,6 +1409,20 @@ fn skip(w: u8, b: &[u8], p: &mut usize) -> Result<Vec<u8>> {
         WIRE_TYPE_FIXED32 => {
             take(b, p, FIXED32_SIZE)?;
         }
+        WIRE_TYPE_START_GROUP => loop {
+            if *p == b.len() {
+                return Err(Error::new(*p, "unterminated group"));
+            }
+            let (nested_number, nested_wire_type) = read_key(b, p)?;
+            if nested_wire_type == WIRE_TYPE_END_GROUP {
+                if nested_number != field_number {
+                    return Err(Error::new(*p, "mismatched end-group field number"));
+                }
+                break;
+            }
+            skip(nested_number, nested_wire_type, b, p)?;
+        },
+        WIRE_TYPE_END_GROUP => return Err(Error::new(*p, "unexpected end-group tag")),
         _ => return Err(Error::new(*p, "unsupported wire type")),
     }
     audit_bytes(b, s, *p)
@@ -1406,10 +1430,12 @@ fn skip(w: u8, b: &[u8], p: &mut usize) -> Result<Vec<u8>> {
 
 /// Skips one unknown value under decode length and varint policies.
 fn skip_decode(
+    field_number: u32,
     wire_type: u8,
     bytes: &[u8],
     cursor: &mut usize,
-    context: &DecodeContext<'_>,
+    context: &mut DecodeContext<'_>,
+    depth: usize,
 ) -> Result<Vec<u8>> {
     let start = *cursor;
     match wire_type {
@@ -1426,6 +1452,41 @@ fn skip_decode(
         WIRE_TYPE_FIXED32 => {
             take(bytes, cursor, FIXED32_SIZE)?;
         }
+        WIRE_TYPE_START_GROUP => {
+            let nested_depth = depth
+                .checked_add(1)
+                .ok_or_else(|| Error::new(*cursor, "recursion depth overflow"))?;
+            if nested_depth > context.options.max_recursion_depth {
+                return Err(Error::new(
+                    *cursor,
+                    "group exceeds configured recursion limit",
+                ));
+            }
+            loop {
+                if *cursor == bytes.len() {
+                    return Err(Error::new(*cursor, "unterminated group"));
+                }
+                let field_start = *cursor;
+                context.count_field(field_start)?;
+                let (nested_number, nested_wire_type) =
+                    read_key_with_policy(bytes, cursor, context.options.require_minimal_varints)?;
+                if nested_wire_type == WIRE_TYPE_END_GROUP {
+                    if nested_number != field_number {
+                        return Err(Error::new(*cursor, "mismatched end-group field number"));
+                    }
+                    break;
+                }
+                skip_decode(
+                    nested_number,
+                    nested_wire_type,
+                    bytes,
+                    cursor,
+                    context,
+                    nested_depth,
+                )?;
+            }
+        }
+        WIRE_TYPE_END_GROUP => return Err(Error::new(*cursor, "unexpected end-group tag")),
         _ => return Err(Error::new(*cursor, "unsupported wire type")),
     }
     audit_bytes(bytes, start, *cursor)
@@ -1484,7 +1545,7 @@ fn decode_inner(
         context.count_field(field_start)?;
         let (n, w) = read_key_with_policy(b, &mut p, context.options.require_minimal_varints)?;
         let Some(f) = d.field_by_number(n) else {
-            let encoded_value = skip_decode(w, b, &mut p, context)?;
+            let encoded_value = skip_decode(n, w, b, &mut p, context, depth)?;
             if context.options.unknown_fields == UnknownFieldPolicy::Reject {
                 return Err(Error::new(field_start, "unknown field rejected by policy"));
             }
@@ -1495,7 +1556,7 @@ fn decode_inner(
                     encoded_value,
                 });
             }
-            let tag = if w == WIRE_TYPE_LENGTH_DELIMITED {
+            let tag = if matches!(w, WIRE_TYPE_LENGTH_DELIMITED | WIRE_TYPE_START_GROUP) {
                 AuditTag::UnknownMessage
             } else {
                 AuditTag::UnknownField

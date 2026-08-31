@@ -31,7 +31,9 @@ The following checks apply to both compatibility and strict decoding:
 - Varints longer than ten bytes and overflowing tenth bytes are rejected.
 - Field keys wider than five bytes are rejected.
 - Field number zero and numbers above 536,870,911 are rejected.
-- Unsupported group wire types are rejected.
+- Unknown groups are recursively skipped only when their end tag matches the
+  opening field number; truncated, mismatched, and standalone end-group tags
+  are rejected.
 - A schema-known field with the wrong wire type is rejected.
 - Every descriptor-known string is checked for valid UTF-8.
 - Length arithmetic uses checked addition before slicing.
@@ -283,8 +285,10 @@ The following items are not currently implemented:
   application protocol.
 - Semantic inspection of opaque `bytes` fields that themselves contain a
   serialized protobuf message.
-- Proto2 groups, extensions, MessageSet, Editions, JSON, and text format. Their
-  status is tracked in [`CONFORMANCE.md`](CONFORMANCE.md).
+- Declared proto2 groups and extensions, MessageSet, Editions, JSON, and text
+  format. Unknown group wire values are supported even though group schema
+  declarations are not. Their status is tracked in
+  [`CONFORMANCE.md`](CONFORMANCE.md).
 
 Protobuf serialization is not universally canonical. Do not use encoded bytes
 as a stable cross-version signature or identity merely because numeric field,

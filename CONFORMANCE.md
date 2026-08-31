@@ -37,11 +37,13 @@ The following binary-wire areas are exercised and pass:
   behavior.
 - Preservation and reserialization of unknown fields using supported wire
   types.
+- Safe skipping and preservation of unknown legacy group wire values, including
+  matching end-group validation.
 
 The last verified result is:
 
 ```text
-Binary/JSON suite: 1400 successes, 1406 skipped, 0 expected failures,
+Binary/JSON suite: 1414 successes, 1392 skipped, 0 expected failures,
                    0 unexpected failures
 Text suite:          0 successes,  434 skipped, 0 expected failures,
                    0 unexpected failures
@@ -60,15 +62,16 @@ following known feature families are outside the supported conformance scope.
 - **Protocol Buffers text format:** Text payloads and text output requests are
   answered with `ConformanceResponse.skipped`. Consequently, the text suite's
   434 cases are all reported as skipped.
-- **Proto2 groups, extensions, and MessageSet:** Binary proto2 cases that need
-  an unsupported legacy wire construct are answered as skipped when the codec
-  reports the unsupported wire type. Ordinary proto2 binary cases continue to
-  run and pass.
 - **JSPB:** JSPB payload or output requests are answered as skipped. JSPB is an
   optional upstream format and is not part of the claimed binary coverage.
 
 ### Tests not scheduled as supported coverage
 
+- **Declared proto2 groups, extensions, and MessageSet reflection:** The parser
+  does not expose descriptors for these legacy constructs. Nevertheless, every
+  group- and MessageSet-shaped binary test scheduled by the pinned runner now
+  passes through safe unknown-wire preservation. This result does not imply
+  typed extension lookup or MessageSet reflection support.
 - **Editions 2023 and unstable Editions:** The runner is not given a maximum
   Editions level, because Editions syntax and feature resolution are not
   implemented. If an Editions request is nevertheless received, the adapter

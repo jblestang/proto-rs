@@ -122,8 +122,9 @@ pub use codec::{
 };
 use core::fmt;
 pub use schema::{
-    Cardinality, Enum, EnumValue, Field, FieldType, Import, ImportKind, MessageDescriptor,
-    Registry, Schema, Syntax, parse,
+    Cardinality, CustomOptionDescriptor, Enum, EnumValue, Field, FieldType, Import, ImportKind,
+    MessageDescriptor, MethodDescriptor, OneofDescriptor, OptionSetting, OptionValueKind, Registry,
+    Schema, ServiceDescriptor, Syntax, parse,
 };
 /// Error returned when schema or wire data cannot be processed safely.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1043,6 +1044,10 @@ mod tests {
         let invalid = [
             r#"syntax="proto3"; message A { int32 a = 1; int32 b = 1; }"#,
             r#"syntax="proto3"; message A { int32 a = 1; string a = 2; }"#,
+            r#"syntax="proto3"; message A { int32 foo_bar = 1; string fooBar = 2; }"#,
+            r#"syntax="proto3"; message A {
+                 int32 first = 1 [json_name="value"];
+                 string second = 2 [json_name="value"]; }"#,
             r#"syntax="proto3"; message A { reserved 1; int32 a = 1; }"#,
             r#"syntax="proto3"; message A { reserved "a"; int32 a = 1; }"#,
             r#"syntax="proto2"; message A { int32 a = 1; }"#,
@@ -1138,6 +1143,211 @@ mod tests {
         registry.register(
             "middle.proto",
             r#"syntax="proto3"; import public "common.proto"; message Middle {}"#,
+        );
+        assert!(registry.parse("root.proto").is_ok());
+    }
+
+    /// Unknown legacy groups remain auditable and round-trip without interpretation.
+    #[test]
+    fn preserves_unknown_wire_groups_and_rejects_malformed_groups() {
+        let schema = parse(r#"syntax="proto3"; message Empty {}"#).unwrap();
+        let descriptor = schema.message("Empty").unwrap();
+        let group = [0x53, 0x08, 0x07, 0x54];
+        let message = decode(&schema, descriptor, &group).unwrap();
+        assert!(
+            message.audit.iter().any(|record| {
+                record.tag == AuditTag::UnknownMessage && record.field_number == 10
+            })
+        );
+        assert_eq!(encode(&schema, descriptor, &message).unwrap(), group);
+        assert!(decode(&schema, descriptor, &[0x53, 0x08, 0x07]).is_err());
+        assert!(decode(&schema, descriptor, &[0x53, 0x5c]).is_err());
+        assert!(decode(&schema, descriptor, &[0x54]).is_err());
+
+        let nested_schema = parse(
+            r#"syntax="proto2";
+               message MessageSetLike { extensions 4 to max; }
+               message Outer { optional MessageSetLike value = 500; }"#,
+        )
+        .unwrap();
+        let outer = nested_schema.message("Outer").unwrap();
+        let message_set = [
+            0xa2, 0x1f, 0x0b, 0x0b, 0x10, 0x90, 0xb3, 0xfc, 0x01, 0x1a, 0x02, 0x48, 0x63, 0x0c,
+        ];
+        let message = decode(&nested_schema, outer, &message_set).unwrap();
+        assert_eq!(
+            encode(&nested_schema, outer, &message).unwrap(),
+            message_set
+        );
+    }
+
+    /// Proto3 rejects legacy declarations while retaining custom-option extensions.
+    #[test]
+    fn enforces_proto3_group_and_extension_rules() {
+        let invalid = [
+            r#"syntax="proto3"; message A { optional group G = 1 {} }"#,
+            r#"syntax="proto3"; message A { extensions 100 to 200; }"#,
+            r#"syntax="proto3"; message A {} extend A { optional int32 x = 100; }"#,
+        ];
+        for source in invalid {
+            assert!(
+                parse(source).is_err(),
+                "schema unexpectedly accepted: {source}"
+            );
+        }
+    }
+
+    /// Services preserve streaming and method metadata and require message endpoints.
+    #[test]
+    fn resolves_and_validates_proto3_services() {
+        let schema = parse(
+            r#"syntax="proto3"; package api;
+               message Request {} message Response {}
+               service Gateway {
+                 option deprecated = true;
+                 rpc Exchange(stream Request) returns (stream Response) {
+                   option idempotency_level = IDEMPOTENT;
+                 }
+               }"#,
+        )
+        .unwrap();
+        let service = schema.service("Gateway").unwrap();
+        let method = &service.methods[0];
+        assert_eq!(method.input_type, "api.Request");
+        assert_eq!(method.output_type, "api.Response");
+        assert!(method.client_streaming && method.server_streaming);
+        assert_eq!(method.options[0].name, "idempotency_level");
+
+        assert!(
+            parse(
+                r#"syntax="proto3"; enum E { ZERO = 0; }
+               message R {} service S { rpc Bad(E) returns (R); }"#,
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                r#"syntax="proto3"; message R {}
+               service S { rpc Same(R) returns (R); rpc Same(R) returns (R); }"#,
+            )
+            .is_err()
+        );
+    }
+
+    /// Built-in and custom options are retained only after semantic validation.
+    #[test]
+    fn resolves_and_validates_proto3_custom_options() {
+        const DESCRIPTOR_OPTIONS: &str = r#"syntax="proto2"; package google.protobuf;
+               message MessageOptions { extensions 1000 to max; }
+               message FieldOptions { extensions 1000 to max; }"#;
+        let mut registry = Registry::new();
+        registry.register("google/protobuf/descriptor.proto", DESCRIPTOR_OPTIONS);
+        registry.register(
+            "options.proto",
+            r#"syntax="proto3"; package audit;
+               import "google/protobuf/descriptor.proto";
+               message Metadata { string label = 1; }
+               extend google.protobuf.MessageOptions {
+                 Metadata annotation = 50001;
+               }
+               extend google.protobuf.FieldOptions {
+                 bool sensitive = 50002;
+                 repeated string labels = 50003;
+               }
+               message Record {
+                 option (annotation) = { label: "important" };
+                 string value = 1 [(sensitive) = true, (labels) = "one", (labels) = "two"];
+               }"#,
+        );
+        let schema = registry.parse("options.proto").unwrap();
+        assert_eq!(schema.custom_options.len(), 3);
+        let record = schema.message("audit.Record").unwrap();
+        assert_eq!(record.options[0].name, "(annotation)");
+        assert_eq!(record.fields[0].options.len(), 3);
+
+        let mut imported = Registry::new();
+        imported.register("google/protobuf/descriptor.proto", DESCRIPTOR_OPTIONS);
+        imported.register(
+            "declared_options.proto",
+            r#"syntax="proto3"; package audit;
+               import "google/protobuf/descriptor.proto";
+               message Metadata { string label = 1; }
+               extend google.protobuf.MessageOptions { Metadata annotation = 50001; }"#,
+        );
+        imported.register(
+            "consumer.proto",
+            r#"syntax="proto3"; package consumer;
+               import "declared_options.proto";
+               message Event { option (audit.annotation).label = "external"; }"#,
+        );
+        let imported_schema = imported.parse("consumer.proto").unwrap();
+        assert_eq!(
+            imported_schema.message("consumer.Event").unwrap().options[0].name,
+            "(audit.annotation).label"
+        );
+
+        let invalid_builtin = [
+            r#"syntax="proto3"; message A { option unknown = true; }"#,
+            r#"syntax="proto3"; option packed = true; message A {}"#,
+            r#"syntax="proto3"; message A { option (missing) = true; }"#,
+        ];
+        for source in invalid_builtin {
+            assert!(
+                parse(source).is_err(),
+                "schema unexpectedly accepted: {source}"
+            );
+        }
+
+        let invalid_custom = [
+            r#"syntax="proto3"; package p; import "google/protobuf/descriptor.proto";
+               extend google.protobuf.FieldOptions { bool flag = 50001; }
+               message A { option (flag) = true; }"#,
+            r#"syntax="proto3"; package p; import "google/protobuf/descriptor.proto";
+               extend google.protobuf.FieldOptions { bool flag = 50001; }
+               message A { string x = 1 [(flag) = "yes"]; }"#,
+            r#"syntax="proto3"; package p; import "google/protobuf/descriptor.proto";
+               extend google.protobuf.FieldOptions { bool reserved_number = 999; }"#,
+        ];
+        for source in invalid_custom {
+            let mut registry = Registry::new();
+            registry.register("google/protobuf/descriptor.proto", DESCRIPTOR_OPTIONS);
+            registry.register("invalid.proto", source);
+            assert!(
+                registry.parse("invalid.proto").is_err(),
+                "schema unexpectedly accepted: {source}"
+            );
+        }
+    }
+
+    /// Import cycles and proto3 references to proto2 enums are semantic errors.
+    #[test]
+    fn rejects_import_cycles_and_proto2_enum_references() {
+        let mut registry = Registry::new();
+        registry.register(
+            "a.proto",
+            r#"syntax="proto3"; import "b.proto"; message A {}"#,
+        );
+        registry.register(
+            "b.proto",
+            r#"syntax="proto3"; import "a.proto"; message B {}"#,
+        );
+        assert!(registry.parse("a.proto").is_err());
+
+        let mut registry = Registry::new();
+        registry.register(
+            "legacy.proto",
+            r#"syntax="proto2"; package legacy; enum State { ZERO = 0; } message Data {}"#,
+        );
+        registry.register(
+            "root.proto",
+            r#"syntax="proto3"; import "legacy.proto";
+               message Invalid { legacy.State state = 1; }"#,
+        );
+        assert!(registry.parse("root.proto").is_err());
+        registry.register(
+            "root.proto",
+            r#"syntax="proto3"; import "legacy.proto";
+               message Valid { legacy.Data data = 1; }"#,
         );
         assert!(registry.parse("root.proto").is_ok());
     }

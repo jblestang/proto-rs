@@ -135,12 +135,6 @@ fn response(schema: &Schema, request_bytes: &[u8]) -> Message {
             Ok(bytes) => field("protobuf_payload", Value::Bytes(bytes)),
             Err(error) => field("serialize_error", Value::String(error.to_string())),
         },
-        Err(error)
-            if message_type == "protobuf_test_messages.proto2.TestAllTypesProto2"
-                && error.message == "unsupported wire type" =>
-        {
-            skipped("proto2 groups, extensions, and MessageSet are not implemented")
-        }
         Err(error) => field("parse_error", Value::String(error.to_string())),
     }
 }

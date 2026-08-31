@@ -17,6 +17,8 @@ does not require generated Rust types: messages are represented by generic
 
 - Proto2 and proto3 syntax declarations
 - Packages, nested messages, enums, oneofs, repeated and packed fields
+- Services and streaming RPC descriptors with resolved message endpoints
+- Retained and type-checked built-in and custom descriptor options
 - Dynamic maps with protobuf defaults and last-key-wins semantics
 - Transitive normal, public, and weak import resolution from in-memory sources
 - Syntax and semantic validation of identifiers, declarations, namespaces,
@@ -66,8 +68,9 @@ assert_eq!(decode(&schema, greeting, &bytes)?, message);
 For imports, register every source with `Registry::register` and then call
 `Registry::parse(root_path)`. The registry owns all schema text before parsing,
 so import resolution requires neither filesystem nor standard-library access.
-Services and custom options are skipped because they do not affect message
-wire encoding.
+Services, RPC methods, and options are retained as dynamic descriptors.
+Custom options must resolve to a declared extension of the matching descriptor
+options message, and their scalar or aggregate value shape is validated.
 
 Decoded messages contain an occurrence-level audit trail. `AuditTag` identifies
 schema fields, unknown fields, unknown length-delimited messages, application
@@ -111,12 +114,14 @@ official Protocol Buffers conformance test suite without generated Rust message
 code. Against protobuf v34.1, the strict (`--enforce_recommended`) run reports:
 
 ```text
-1400 successes, 1406 skipped, 0 expected failures, 0 unexpected failures
+1414 successes, 1392 skipped, 0 expected failures, 0 unexpected failures
 ```
 
 This covers full proto3 binary behavior and basic proto2 binary behavior.
-JSON, text format, Editions, proto2 groups/extensions, and MessageSet are the
-only intentionally ignored or excluded capabilities.
+JSON, text format, and Editions are intentionally ignored formats. Declared
+proto2 groups/extensions and MessageSet reflection remain outside the schema
+model, although all group- and MessageSet-shaped binary cases scheduled by the
+pinned suite now pass through safe unknown-wire preservation.
 [CONFORMANCE.md](CONFORMANCE.md) explains exactly which tests pass, which are
 explicitly skipped, which are not scheduled, and what the suite does not
 prove. GitHub CI rebuilds the official runner from the commit in

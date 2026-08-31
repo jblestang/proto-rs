@@ -41,6 +41,12 @@ pub(crate) const KW_GROUP: &str = "group";
 pub(crate) const KW_MAP: &str = "map";
 /// `service` declaration keyword.
 pub(crate) const KW_SERVICE: &str = "service";
+/// `rpc` service-method declaration keyword.
+pub(crate) const KW_RPC: &str = "rpc";
+/// `returns` separator in an RPC method declaration.
+pub(crate) const KW_RETURNS: &str = "returns";
+/// `stream` modifier on an RPC request or response type.
+pub(crate) const KW_STREAM: &str = "stream";
 /// Range keyword separating inclusive reserved endpoints.
 pub(crate) const KW_TO: &str = "to";
 /// Keyword selecting the largest legal reserved range endpoint.
@@ -99,6 +105,8 @@ pub(crate) const MAX_FIELD_NUMBER: u32 = 536_870_911;
 pub(crate) const RESERVED_FIELD_NUMBER_START: u32 = 19_000;
 /// Last field number reserved for protobuf implementations.
 pub(crate) const RESERVED_FIELD_NUMBER_END: u32 = 19_999;
+/// First extension number available in every descriptor options message.
+pub(crate) const CUSTOM_OPTION_MIN_FIELD_NUMBER: u32 = 1_000;
 
 /// Number of low key bits occupied by the wire type.
 pub(crate) const FIELD_NUMBER_SHIFT: usize = 3;
@@ -110,6 +118,10 @@ pub(crate) const WIRE_TYPE_VARINT: u8 = 0;
 pub(crate) const WIRE_TYPE_FIXED64: u8 = 1;
 /// Length-delimited wire type used by strings, bytes, messages, and packing.
 pub(crate) const WIRE_TYPE_LENGTH_DELIMITED: u8 = 2;
+/// Start-group wire type retained for unknown legacy fields.
+pub(crate) const WIRE_TYPE_START_GROUP: u8 = 3;
+/// End-group wire type terminating a matching start-group field.
+pub(crate) const WIRE_TYPE_END_GROUP: u8 = 4;
 /// 32-bit wire type used by fixed32, sfixed32, and float.
 pub(crate) const WIRE_TYPE_FIXED32: u8 = 5;
 
@@ -154,6 +166,10 @@ pub(crate) const fn make_key(field_number: u32, wire_type: u8) -> u64 {
 pub(crate) const fn is_supported_wire_type(wire_type: u8) -> bool {
     matches!(
         wire_type,
-        WIRE_TYPE_VARINT | WIRE_TYPE_FIXED64 | WIRE_TYPE_LENGTH_DELIMITED | WIRE_TYPE_FIXED32
+        WIRE_TYPE_VARINT
+            | WIRE_TYPE_FIXED64
+            | WIRE_TYPE_LENGTH_DELIMITED
+            | WIRE_TYPE_START_GROUP
+            | WIRE_TYPE_FIXED32
     )
 }

@@ -18,7 +18,7 @@
 //! Missing weak imports are tolerated.
 //! Direct imports expose their declarations to the importing source.
 //! Only public imports re-export declarations to the next import level.
-//! Cyclic imports terminate through the visited-path set.
+//! Cyclic imports are rejected after the reachable graph is collected.
 //! Duplicate symbols across loaded sources are rejected.
 //! Registry parsing preserves the root file's package and syntax metadata.
 //!
@@ -58,8 +58,8 @@
 //! A missing syntax declaration follows the historical proto2 default.
 //! Package declarations qualify top-level messages and enums.
 //! Normal, public, and weak import declarations are retained.
-//! File options are consumed without affecting wire descriptors.
-//! Services are skipped because they do not describe message wire fields.
+//! File options are retained and checked against their descriptor scope.
+//! Services and RPC methods are retained with resolved message endpoints.
 //! Unknown or malformed top-level statements are rejected by the grammar.
 //! Valid non-wire declarations are checked syntactically but not retained.
 //!
@@ -75,7 +75,8 @@
 //! Extend blocks are recognized and skipped in the basic proto2 tier.
 //! Legacy group declarations are recognized and structurally skipped.
 //! Skipping groups lets surrounding basic proto2 fields remain usable.
-//! Group wire types and MessageSet semantics remain codec feature exclusions.
+//! Declared group descriptors and MessageSet semantics remain exclusions.
+//! Unknown group wire values are safely skipped, audited, and preservable.
 //!
 //! # Field descriptors
 //!
@@ -119,13 +120,112 @@
 //! Cross-file names use the same resolution rules as local names.
 //! This phase also finalizes explicit presence and packing metadata.
 //!
+//! # Semantic pass ordering
+//!
+//! Parsing and semantic resolution are deliberately separate operations.
+//! Pest first proves that every token belongs to the protobuf grammar.
+//! The descriptor builder then checks declarations local to one source file.
+//! Registry traversal collects every source reachable from the selected root.
+//! Required imports must exist before any type lookup is attempted.
+//! Weak imports may be absent and then contribute no declarations.
+//! A depth-first graph pass rejects self-imports and longer import cycles.
+//! Visibility is computed independently for every reachable source file.
+//! Direct imports expose all declarations to the importing file.
+//! A public import additionally exposes its declarations to later importers.
+//! Ordinary transitive imports do not accidentally leak private declarations.
+//! Declaration resolution runs for every file before option uses are checked.
+//! This ordering lets consumers use options declared in imported source files.
+//! It also lets an option declaration privately import its own value message.
+//! Field and RPC types use the visibility of the file that mentions the name.
+//! Custom extension value types use the visibility of their declaring file.
+//! Option uses use the fully resolved extension descriptor from that first pass.
+//! The final merge occurs only after every file passes its local semantic checks.
+//! Merge conflicts therefore cannot leave a partially valid public [`Schema`].
+//! All maps used during these passes are deterministic allocation-backed trees.
+//!
+//! # Proto3 declaration invariants
+//!
+//! Proto3 fields cannot use the legacy `required` cardinality.
+//! An explicit `optional` field is distinguished from an implicit singular field.
+//! Message fields retain presence regardless of whether `optional` was written.
+//! Oneof members retain presence and may not carry cardinality labels.
+//! Map fields cannot be labeled, packed, nested inside oneof, or used as keys.
+//! Every map key must belong to the scalar key subset defined by protobuf.
+//! Field numbers are checked against both the numeric limit and reserved range.
+//! A field cannot reuse a reserved name or any number in a reserved interval.
+//! Field names, nested declarations, oneofs, and enum values share their proper
+//! protobuf namespaces and are rejected when those namespaces collide.
+//! Derived and explicit JSON field names must also be unique within a message.
+//! This JSON-name rule is semantic even though this crate has no JSON codec.
+//! Proto3 enum declarations must start with a member whose numeric value is zero.
+//! Duplicate enum names are always invalid.
+//! Duplicate enum numbers require an explicit `allow_alias = true` option.
+//! Enum values cannot reuse names or numbers reserved by their declaration.
+//! A proto3 field cannot refer to an enum declared by a proto2 source file.
+//! It may refer to a proto2 message because message wire semantics are compatible.
+//! Groups and ordinary extension ranges remain illegal proto3 declarations.
+//! The only accepted proto3 `extend` target is a descriptor options message.
+//! Custom-option field numbers must belong to the descriptor extension range.
+//! Unknown declarations fail instead of being silently discarded as fields.
+//!
+//! # Option resolution guarantees
+//!
+//! Every option occurrence retains its normalized source name and value text.
+//! Its lexical kind distinguishes identifiers, strings, numbers, and aggregates.
+//! Built-in names are checked against the descriptor scope where they appear.
+//! Thus a valid field option cannot be misplaced on a file or service.
+//! Boolean built-ins accept only the protobuf identifiers `true` and `false`.
+//! String built-ins require a quoted string literal.
+//! Enum-shaped built-ins require an identifier and validate their known members.
+//! Singular built-in options may not occur more than once at the same scope.
+//! A custom option name begins with a parenthesized extension reference.
+//! Absolute custom names bypass lexical lookup just like absolute type names.
+//! Relative custom names search the innermost scope and then each parent scope.
+//! The resolved extension must target the options message for the current scope.
+//! For example, a `FieldOptions` extension cannot be attached to a message.
+//! Singular custom options reject repeated assignments of the same option path.
+//! Repeated custom extension fields permit repeated assignments in source order.
+//! Scalar custom options require the matching literal category.
+//! Enum custom options accept either a symbolic identifier or numeric literal.
+//! Message-valued custom options require a braced aggregate at their root.
+//! A dotted custom-option suffix traverses resolved message fields one component
+//! at a time and rejects unknown components or traversal through scalar values.
+//! Custom map option values are rejected because extensions cannot be map fields.
+//! Descriptor option messages themselves must be visible through the Registry.
+//! This prevents a well-known type spelling from substituting for a real import.
+//!
+//! # Service descriptor guarantees
+//!
+//! Services participate in the same package namespace as messages and enums.
+//! Each service retains its source order, options, and package-qualified name.
+//! Method names must be unique within their containing service.
+//! Request and response names use ordinary protobuf lexical lookup.
+//! Both endpoints must resolve to message declarations rather than enums.
+//! Client-streaming and server-streaming modifiers are retained independently.
+//! Method option blocks and semicolon-only methods produce the same descriptor
+//! shape except for their retained option collections.
+//! Services do not affect binary message encoding but remain reflection data.
+//! Invalid services prevent the complete schema from being returned.
+//!
+//! # Wire groups versus group declarations
+//!
+//! Proto3 never permits a declared group field in its source schema.
+//! Binary protobuf still reserves start-group and end-group wire tags.
+//! A newer or legacy sender can therefore place an unknown group on the wire.
+//! The codec treats that occurrence as unknown structured data, not a declaration.
+//! It recursively verifies nesting and matching end-group field numbers.
+//! Exact bytes can be retained for compatibility forwarding and auditing.
+//! This does not synthesize a typed group descriptor or expose group members.
+//! MessageSet-shaped unknown data benefits from the same preservation behavior.
+//! Passing those wire round trips does not imply typed MessageSet reflection.
+//!
 //! # Enums
 //!
 //! [`Enum`] retains its short name, full name, and ordered values.
 //! [`EnumValue`] retains both symbolic name and signed numeric value.
 //! Negative enum values are supported.
 //! Aliases are retained as independent ordered declarations.
-//! Enum options such as `allow_alias` are consumed but not interpreted.
+//! Enum options are retained, validated, and `allow_alias` is interpreted.
 //! Unknown enum numbers remain valid at wire decode time.
 //! Proto3 enums must declare a zero-valued first member.
 //! Duplicate numeric values require `option allow_alias = true`.
@@ -166,12 +266,15 @@
 //!
 //! # Options and non-wire declarations
 //!
-//! The parser extracts `packed` and `default` field options.
-//! Other field options are consumed without entering the wire descriptor.
-//! File and message options are skipped at their syntactic boundary.
-//! Custom options are not evaluated.
+//! Built-in options are retained and validated for descriptor scope and type.
+//! The parser interprets field `packed` and `default` where they affect wire
+//! behavior and enum `allow_alias` where it affects declaration validity.
+//! Proto3 custom-option extensions of descriptor option messages are retained.
+//! Custom-option uses undergo lexical lookup, scope, duplicate, path, and value
+//! validation against the resolved extension field descriptor.
 //! Reserved names and ranges are not exposed as descriptor collections yet.
-//! RPC service and method declarations are not exposed.
+//! Services expose ordered methods, streaming flags, options, and resolved
+//! request and response message names.
 //! Source-code comments are not retained in descriptors.
 //! These omissions do not change binary field encoding for supported messages.
 //!
@@ -205,7 +308,7 @@
 //! Basic proto2 binary behavior uses the same dynamic descriptors and codec.
 //! Basic proto2 includes ordinary scalars, messages, enums, maps, and oneofs.
 //! Basic proto2 includes required-field checks and explicit packing options.
-//! Legacy groups, extensions, and MessageSet are recognized but unsupported.
+//! Declared legacy groups, ordinary extensions, and MessageSet are unsupported.
 //! Editions syntax and feature resolution are not implemented.
 //! JSON and text-format parsing belong to separate future codec layers.
 //! The repository's `CONFORMANCE.md` is the authoritative support declaration.
@@ -213,14 +316,15 @@
 use crate::{
     Error, Result,
     constants::{
-        BOOLEAN_FALSE, BOOLEAN_TRUE, KW_ENUM, KW_EXTEND, KW_EXTENSIONS, KW_GROUP, KW_IMPORT,
-        KW_MAP, KW_MAX, KW_MESSAGE, KW_ONEOF, KW_OPTION, KW_OPTIONAL, KW_PACKAGE, KW_PUBLIC,
-        KW_REPEATED, KW_REQUIRED, KW_RESERVED, KW_SERVICE, KW_SYNTAX, KW_TO, KW_WEAK,
-        LONG_UNICODE_ESCAPE_DIGITS, MAX_FIELD_NUMBER, MIN_FIELD_NUMBER, OPTION_ALLOW_ALIAS,
-        OPTION_DEFAULT, OPTION_PACKED, RESERVED_FIELD_NUMBER_END, RESERVED_FIELD_NUMBER_START,
-        SHORT_UNICODE_ESCAPE_DIGITS, SYNTAX_PROTO2, SYNTAX_PROTO3, TYPE_BOOL, TYPE_BYTES,
-        TYPE_DOUBLE, TYPE_FIXED32, TYPE_FIXED64, TYPE_FLOAT, TYPE_INT32, TYPE_INT64, TYPE_SFIXED32,
-        TYPE_SFIXED64, TYPE_SINT32, TYPE_SINT64, TYPE_STRING, TYPE_UINT32, TYPE_UINT64,
+        BOOLEAN_FALSE, BOOLEAN_TRUE, CUSTOM_OPTION_MIN_FIELD_NUMBER, KW_ENUM, KW_EXTEND,
+        KW_EXTENSIONS, KW_GROUP, KW_IMPORT, KW_MAP, KW_MAX, KW_MESSAGE, KW_ONEOF, KW_OPTION,
+        KW_OPTIONAL, KW_PACKAGE, KW_PUBLIC, KW_REPEATED, KW_REQUIRED, KW_RESERVED, KW_RETURNS,
+        KW_RPC, KW_SERVICE, KW_STREAM, KW_SYNTAX, KW_TO, KW_WEAK, LONG_UNICODE_ESCAPE_DIGITS,
+        MAX_FIELD_NUMBER, MIN_FIELD_NUMBER, OPTION_ALLOW_ALIAS, OPTION_DEFAULT, OPTION_PACKED,
+        RESERVED_FIELD_NUMBER_END, RESERVED_FIELD_NUMBER_START, SHORT_UNICODE_ESCAPE_DIGITS,
+        SYNTAX_PROTO2, SYNTAX_PROTO3, TYPE_BOOL, TYPE_BYTES, TYPE_DOUBLE, TYPE_FIXED32,
+        TYPE_FIXED64, TYPE_FLOAT, TYPE_INT32, TYPE_INT64, TYPE_SFIXED32, TYPE_SFIXED64,
+        TYPE_SINT32, TYPE_SINT64, TYPE_STRING, TYPE_UINT32, TYPE_UINT64,
     },
 };
 use alloc::{
@@ -332,6 +436,8 @@ pub struct Field {
     pub explicit_presence: bool,
     /// Raw proto2 default literal, retained for reflection and auditing.
     pub default: Option<String>,
+    /// Source options retained in declaration order.
+    pub options: Vec<OptionSetting>,
 }
 /// Runtime descriptor for one protobuf message declaration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -342,6 +448,10 @@ pub struct MessageDescriptor {
     pub full_name: String,
     /// Fields in declaration order.
     pub fields: Vec<Field>,
+    /// Oneof declarations in source order, including their options.
+    pub oneofs: Vec<OneofDescriptor>,
+    /// Message options retained for reflection and semantic auditing.
+    pub options: Vec<OptionSetting>,
 }
 impl MessageDescriptor {
     /// Finds a field descriptor by its numeric protobuf tag.
@@ -360,6 +470,8 @@ pub struct EnumValue {
     pub name: String,
     /// Signed numeric enum value.
     pub number: i32,
+    /// Enum-value options retained for semantic auditing.
+    pub options: Vec<OptionSetting>,
 }
 /// Runtime descriptor for a protobuf enumeration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -370,6 +482,80 @@ pub struct Enum {
     pub full_name: String,
     /// Declared enumeration members.
     pub values: Vec<EnumValue>,
+    /// Syntax of the file that declares this enumeration.
+    pub syntax: Syntax,
+    /// Enum options retained for reflection and semantic auditing.
+    pub options: Vec<OptionSetting>,
+}
+/// One source-level protobuf option after lexical normalization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptionSetting {
+    /// Built-in name or parenthesized custom-option name.
+    pub name: String,
+    /// Scalar or aggregate source value without surrounding whitespace.
+    pub value: String,
+    /// Lexical category used for built-in option type validation.
+    pub value_kind: OptionValueKind,
+}
+/// Lexical category of a protobuf option value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionValueKind {
+    /// Identifier value, including booleans and enum member names.
+    Identifier,
+    /// One or more adjacent quoted string literals.
+    String,
+    /// Integer or floating-point numeric literal.
+    Number,
+    /// Braced aggregate message value.
+    Aggregate,
+}
+/// One oneof declaration and its retained source options.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OneofDescriptor {
+    /// Source-level oneof name.
+    pub name: String,
+    /// Oneof options retained for reflection and validation.
+    pub options: Vec<OptionSetting>,
+}
+/// One RPC method retained from a proto3 service declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MethodDescriptor {
+    /// Method name within its containing service.
+    pub name: String,
+    /// Fully resolved protobuf request message name.
+    pub input_type: String,
+    /// Fully resolved protobuf response message name.
+    pub output_type: String,
+    /// Whether the request side is client-streaming.
+    pub client_streaming: bool,
+    /// Whether the response side is server-streaming.
+    pub server_streaming: bool,
+    /// Method options retained for reflection and semantic auditing.
+    pub options: Vec<OptionSetting>,
+}
+/// Runtime descriptor for a protobuf service declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceDescriptor {
+    /// Unqualified source-level service name.
+    pub name: String,
+    /// Package-qualified service name.
+    pub full_name: String,
+    /// RPC methods in source declaration order.
+    pub methods: Vec<MethodDescriptor>,
+    /// Service options retained for reflection and semantic auditing.
+    pub options: Vec<OptionSetting>,
+}
+/// Proto3 extension field that defines a custom descriptor option.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustomOptionDescriptor {
+    /// Unqualified extension field name.
+    pub name: String,
+    /// Package- and nesting-qualified extension name.
+    pub full_name: String,
+    /// Descriptor options message extended by this declaration.
+    pub extendee: String,
+    /// Field metadata describing the option's value and cardinality.
+    pub field: Field,
 }
 /// Import modifier attached to a protobuf import declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -400,8 +586,14 @@ pub struct Schema {
     pub messages: BTreeMap<String, MessageDescriptor>,
     /// Enum descriptors indexed by fully qualified name.
     pub enums: BTreeMap<String, Enum>,
+    /// Service descriptors indexed by fully qualified name.
+    pub services: BTreeMap<String, ServiceDescriptor>,
+    /// Custom option extensions indexed by fully qualified extension name.
+    pub custom_options: BTreeMap<String, CustomOptionDescriptor>,
     /// Import declarations collected from all reachable sources.
     pub imports: Vec<Import>,
+    /// Root-file options retained for reflection and semantic auditing.
+    pub options: Vec<OptionSetting>,
 }
 
 /// An allocation-backed collection of named `.proto` sources.
@@ -473,6 +665,14 @@ impl Schema {
             self.package
                 .as_ref()
                 .and_then(|package| self.messages.get(&format!("{package}.{name}")))
+        })
+    }
+    /// Looks up a service by fully qualified name or the root package.
+    pub fn service(&self, name: &str) -> Option<&ServiceDescriptor> {
+        self.services.get(name).or_else(|| {
+            self.package
+                .as_ref()
+                .and_then(|package| self.services.get(&format!("{package}.{name}")))
         })
     }
 }
@@ -612,8 +812,14 @@ struct DescriptorBuilder {
     messages: BTreeMap<String, MessageDescriptor>,
     /// Enum descriptors accumulated by fully qualified name.
     enums: BTreeMap<String, Enum>,
+    /// Service descriptors accumulated by fully qualified name.
+    services: BTreeMap<String, ServiceDescriptor>,
+    /// Custom option extensions accumulated by fully qualified name.
+    custom_options: BTreeMap<String, CustomOptionDescriptor>,
     /// Import declarations retained for registry graph traversal.
     imports: Vec<Import>,
+    /// File options retained in source order.
+    options: Vec<OptionSetting>,
 }
 impl DescriptorBuilder {
     /// Returns the current token's source offset, or zero at end of input.
@@ -626,6 +832,10 @@ impl DescriptorBuilder {
     /// Reports whether the current token is the specified identifier.
     fn peek_identifier(&self, expected: &str) -> bool {
         matches!(self.tokens.get(self.cursor),Some((Token::Identifier(value),_))if value==expected)
+    }
+    /// Reports whether the current token is the specified punctuation symbol.
+    fn peek_symbol(&self, expected: char) -> bool {
+        matches!(self.tokens.get(self.cursor),Some((Token::Symbol(value),_))if *value==expected)
     }
     /// Consumes an identifier or reports its source location as an error.
     fn identifier(&mut self) -> Result<String> {
@@ -759,6 +969,91 @@ impl DescriptorBuilder {
         }
     }
 
+    /// Parses a built-in or parenthesized custom option name.
+    fn option_name(&mut self) -> Result<String> {
+        if !self.consume_symbol('(') {
+            return self.identifier();
+        }
+        let extension = self.identifier()?;
+        self.expect_symbol(')')?;
+        let mut name = format!("({extension})");
+        while let Some((Token::Identifier(component), _)) = self.tokens.get(self.cursor) {
+            let Some(component) = component.strip_prefix('.') else {
+                break;
+            };
+            if !is_identifier(component) {
+                return Err(Error::new(self.offset(), "invalid custom option path"));
+            }
+            name.push('.');
+            name.push_str(component);
+            self.cursor += 1;
+        }
+        Ok(name)
+    }
+
+    /// Consumes an aggregate option value while preserving balanced structure.
+    fn aggregate_option_value(&mut self) -> Result<String> {
+        self.expect_symbol('{')?;
+        let mut value = String::from("{");
+        let mut depth = 1usize;
+        while depth != 0 {
+            let (token, _) = self
+                .tokens
+                .get(self.cursor)
+                .cloned()
+                .ok_or_else(|| Error::new(self.offset(), "unterminated aggregate option"))?;
+            self.cursor += 1;
+            match token {
+                Token::Symbol('{') => {
+                    depth += 1;
+                    value.push('{');
+                }
+                Token::Symbol('}') => {
+                    depth -= 1;
+                    value.push('}');
+                }
+                Token::Symbol(symbol) => value.push(symbol),
+                Token::Identifier(text) | Token::NumberLiteral(text) => value.push_str(&text),
+                Token::StringLiteral(text) => {
+                    value.push('"');
+                    value.push_str(&text);
+                    value.push('"');
+                }
+            }
+        }
+        Ok(value)
+    }
+
+    /// Parses one option assignment without consuming its outer delimiter.
+    fn option_setting(&mut self) -> Result<OptionSetting> {
+        let name = self.option_name()?;
+        self.expect_symbol('=')?;
+        let (value, value_kind) = if self.peek_symbol('{') {
+            (self.aggregate_option_value()?, OptionValueKind::Aggregate)
+        } else {
+            let value_kind = match self.tokens.get(self.cursor) {
+                Some((Token::StringLiteral(_), _)) => OptionValueKind::String,
+                Some((Token::NumberLiteral(_), _)) => OptionValueKind::Number,
+                Some((Token::Identifier(_), _)) => OptionValueKind::Identifier,
+                _ => return Err(Error::new(self.offset(), "expected option value")),
+            };
+            (self.option_value()?, value_kind)
+        };
+        Ok(OptionSetting {
+            name,
+            value,
+            value_kind,
+        })
+    }
+
+    /// Parses a complete `option name = value;` declaration.
+    fn option_declaration(&mut self) -> Result<OptionSetting> {
+        self.identifier()?;
+        let option = self.option_setting()?;
+        self.expect_symbol(';')?;
+        Ok(option)
+    }
+
     /// Parses a reserved-name or reserved-number statement through its semicolon.
     fn parse_reserved(&mut self, minimum: i64, maximum: i64) -> Result<ReservedDeclarations> {
         self.identifier()?;
@@ -842,6 +1137,7 @@ impl DescriptorBuilder {
         let mut values = Vec::new();
         let mut reserved = ReservedDeclarations::default();
         let mut allow_alias = false;
+        let mut options = Vec::new();
         while !self.consume_symbol('}') {
             if self.consume_symbol(';') {
                 continue;
@@ -853,13 +1149,9 @@ impl DescriptorBuilder {
                 continue;
             }
             if self.peek_identifier(KW_OPTION) {
-                let option_start = self.cursor;
-                self.identifier()?;
-                if self.peek_identifier(OPTION_ALLOW_ALIAS) {
-                    self.identifier()?;
-                    self.expect_symbol('=')?;
-                    let value = self.option_value()?;
-                    allow_alias = match value.as_str() {
+                let option = self.option_declaration()?;
+                if option.name == OPTION_ALLOW_ALIAS {
+                    allow_alias = match option.value.as_str() {
                         BOOLEAN_TRUE => true,
                         BOOLEAN_FALSE => false,
                         _ => {
@@ -869,11 +1161,8 @@ impl DescriptorBuilder {
                             ));
                         }
                     };
-                    self.expect_symbol(';')?;
-                } else {
-                    self.cursor = option_start;
-                    self.skip_declaration()?;
                 }
+                options.push(option);
                 continue;
             }
             let value_name = self.declaration_name()?;
@@ -881,18 +1170,25 @@ impl DescriptorBuilder {
             let raw_number = self.integer()?;
             let number = i32::try_from(raw_number)
                 .map_err(|_| Error::new(self.offset(), "enum value is outside int32 range"))?;
+            let mut value_options = Vec::new();
             if self.consume_symbol('[') {
-                while !self.consume_symbol(']') {
-                    if self.cursor == self.tokens.len() {
-                        return Err(Error::new(self.offset(), "unterminated enum options"));
+                loop {
+                    if self.consume_symbol(']') {
+                        break;
                     }
-                    self.cursor += 1
+                    value_options.push(self.option_setting()?);
+                    if !self.consume_symbol(']') {
+                        self.expect_symbol(',')?;
+                    } else {
+                        break;
+                    }
                 }
             }
             self.expect_symbol(';')?;
             values.push(EnumValue {
                 name: value_name,
                 number,
+                options: value_options,
             })
         }
         if values.is_empty() {
@@ -946,6 +1242,8 @@ impl DescriptorBuilder {
                 name,
                 full_name,
                 values,
+                syntax: self.syntax,
+                options,
             },
         );
         Ok(())
@@ -960,8 +1258,9 @@ impl DescriptorBuilder {
         let full_name = self.qualify(scope, &name);
         self.expect_symbol('{')?;
         let mut fields = Vec::new();
-        let mut oneof_names = Vec::<String>::new();
+        let mut oneofs = Vec::<OneofDescriptor>::new();
         let mut reserved = ReservedDeclarations::default();
+        let mut options = Vec::new();
         while !self.consume_symbol('}') {
             if self.consume_symbol(';') {
                 continue;
@@ -977,21 +1276,25 @@ impl DescriptorBuilder {
             if self.peek_identifier(KW_ONEOF) {
                 self.identifier()?;
                 let oneof_name = self.declaration_name()?;
-                if oneof_names.contains(&oneof_name) {
+                if oneofs.iter().any(|oneof| oneof.name == oneof_name) {
                     return Err(Error::new(self.offset(), "duplicate oneof name"));
                 }
-                oneof_names.push(oneof_name.clone());
                 self.expect_symbol('{')?;
+                let mut oneof_options = Vec::new();
                 while !self.consume_symbol('}') {
                     if self.consume_symbol(';') {
                         continue;
                     }
                     if self.peek_identifier(KW_OPTION) {
-                        self.skip_declaration()?;
+                        oneof_options.push(self.option_declaration()?);
                         continue;
                     }
                     fields.push(self.parse_field(Some(oneof_name.clone()), None)?)
                 }
+                oneofs.push(OneofDescriptor {
+                    name: oneof_name,
+                    options: oneof_options,
+                });
                 continue;
             }
             if self.peek_identifier(KW_RESERVED) {
@@ -1001,10 +1304,21 @@ impl DescriptorBuilder {
                 reserved.ranges.extend(declaration.ranges);
                 continue;
             }
-            if self.peek_identifier(KW_OPTION)
-                || self.peek_identifier(KW_EXTENSIONS)
-                || self.peek_identifier(KW_EXTEND)
-            {
+            if self.peek_identifier(KW_OPTION) {
+                options.push(self.option_declaration()?);
+                continue;
+            }
+            if self.peek_identifier(KW_EXTEND) && self.syntax == Syntax::Proto3 {
+                self.parse_custom_option_extensions(&full_name)?;
+                continue;
+            }
+            if self.peek_identifier(KW_EXTENSIONS) || self.peek_identifier(KW_EXTEND) {
+                if self.syntax == Syntax::Proto3 {
+                    return Err(Error::new(
+                        self.offset(),
+                        "proto3 extensions are permitted only for custom options",
+                    ));
+                }
                 self.skip_declaration()?;
                 continue;
             }
@@ -1021,12 +1335,22 @@ impl DescriptorBuilder {
                 None
             };
             if self.peek_identifier(KW_GROUP) {
+                if self.syntax == Syntax::Proto3 {
+                    return Err(Error::new(
+                        self.offset(),
+                        "groups are not allowed in proto3",
+                    ));
+                }
                 self.skip_group()?;
                 continue;
             }
             fields.push(self.parse_field(None, cardinality)?)
         }
+        let oneof_names: Vec<String> = oneofs.iter().map(|oneof| oneof.name.clone()).collect();
         validate_message_fields(&fields, &oneof_names, &reserved, self.offset())?;
+        if self.syntax == Syntax::Proto3 {
+            validate_json_field_names(&fields, self.offset())?;
+        }
         if self.messages.contains_key(&full_name) || self.enums.contains_key(&full_name) {
             return Err(Error::new(self.offset(), "duplicate protobuf type name"));
         }
@@ -1036,10 +1360,169 @@ impl DescriptorBuilder {
                 name,
                 full_name,
                 fields,
+                oneofs,
+                options,
             },
         );
         Ok(())
     }
+
+    /// Parses proto3 extensions used exclusively to define custom options.
+    fn parse_custom_option_extensions(&mut self, scope: &str) -> Result<()> {
+        self.identifier()?;
+        let extendee = self.identifier()?;
+        let extendee = extendee.trim_start_matches('.').to_string();
+        if !is_custom_option_extendee(&extendee) {
+            return Err(Error::new(
+                self.offset(),
+                "proto3 extend target must be a descriptor options message",
+            ));
+        }
+        self.expect_symbol('{')?;
+        while !self.consume_symbol('}') {
+            if self.consume_symbol(';') {
+                continue;
+            }
+            let cardinality = if self.peek_identifier(KW_OPTIONAL) {
+                self.identifier()?;
+                Cardinality::Optional
+            } else if self.peek_identifier(KW_REPEATED) {
+                self.identifier()?;
+                Cardinality::Repeated
+            } else if self.peek_identifier(KW_REQUIRED) {
+                return Err(Error::new(
+                    self.offset(),
+                    "required custom options are not allowed in proto3",
+                ));
+            } else {
+                Cardinality::Optional
+            };
+            let field = self.parse_field(None, Some(cardinality))?;
+            if field.number < CUSTOM_OPTION_MIN_FIELD_NUMBER {
+                return Err(Error::new(
+                    self.offset(),
+                    "custom option number is outside the descriptor extension range",
+                ));
+            }
+            let full_name = self.qualify(scope, &field.name);
+            if self.custom_options.contains_key(&full_name)
+                || self.custom_options.values().any(|option| {
+                    option.extendee == extendee && option.field.number == field.number
+                })
+            {
+                return Err(Error::new(
+                    self.offset(),
+                    "duplicate custom option name or number",
+                ));
+            }
+            self.custom_options.insert(
+                full_name.clone(),
+                CustomOptionDescriptor {
+                    name: field.name.clone(),
+                    full_name,
+                    extendee: extendee.clone(),
+                    field,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Parses a proto3 service and retains resolved RPC-facing metadata.
+    fn parse_service(&mut self) -> Result<()> {
+        self.identifier()?;
+        let name = self.declaration_name()?;
+        let full_name = self.qualify("", &name);
+        self.expect_symbol('{')?;
+        let mut methods = Vec::new();
+        let mut options = Vec::new();
+        while !self.consume_symbol('}') {
+            if self.consume_symbol(';') {
+                continue;
+            }
+            if self.peek_identifier(KW_OPTION) {
+                options.push(self.option_declaration()?);
+                continue;
+            }
+            if !self.peek_identifier(KW_RPC) {
+                return Err(Error::new(self.offset(), "expected service option or rpc"));
+            }
+            self.identifier()?;
+            let method_name = self.declaration_name()?;
+            if methods
+                .iter()
+                .any(|method: &MethodDescriptor| method.name == method_name)
+            {
+                return Err(Error::new(self.offset(), "duplicate rpc method name"));
+            }
+            self.expect_symbol('(')?;
+            let client_streaming = if self.peek_identifier(KW_STREAM) {
+                self.identifier()?;
+                true
+            } else {
+                false
+            };
+            let input_type = self.identifier()?;
+            if !is_full_identifier(&input_type, true) {
+                return Err(Error::new(self.offset(), "invalid rpc request type"));
+            }
+            self.expect_symbol(')')?;
+            if !self.peek_identifier(KW_RETURNS) {
+                return Err(Error::new(
+                    self.offset(),
+                    "expected returns in rpc declaration",
+                ));
+            }
+            self.identifier()?;
+            self.expect_symbol('(')?;
+            let server_streaming = if self.peek_identifier(KW_STREAM) {
+                self.identifier()?;
+                true
+            } else {
+                false
+            };
+            let output_type = self.identifier()?;
+            if !is_full_identifier(&output_type, true) {
+                return Err(Error::new(self.offset(), "invalid rpc response type"));
+            }
+            self.expect_symbol(')')?;
+            let mut method_options = Vec::new();
+            if !self.consume_symbol(';') {
+                self.expect_symbol('{')?;
+                while !self.consume_symbol('}') {
+                    if self.consume_symbol(';') {
+                        continue;
+                    }
+                    if !self.peek_identifier(KW_OPTION) {
+                        return Err(Error::new(self.offset(), "expected rpc option"));
+                    }
+                    method_options.push(self.option_declaration()?);
+                }
+            }
+            methods.push(MethodDescriptor {
+                name: method_name,
+                input_type,
+                output_type,
+                client_streaming,
+                server_streaming,
+                options: method_options,
+            });
+        }
+        if self.services.contains_key(&full_name) {
+            return Err(Error::new(self.offset(), "duplicate service name"));
+        }
+        self.services.insert(
+            full_name.clone(),
+            ServiceDescriptor {
+                name,
+                full_name,
+                methods,
+                options,
+            },
+        );
+        Ok(())
+    }
+
     /// Parses and validates one ordinary, oneof, or map field declaration.
     ///
     /// This enforces legal map key types and field-number ranges, extracts the
@@ -1113,19 +1596,18 @@ impl DescriptorBuilder {
         let mut packed = None;
         let mut packed_explicit = false;
         let mut default = None;
+        let mut options = Vec::new();
         if self.consume_symbol('[') {
             loop {
                 if self.consume_symbol(']') {
                     break;
                 }
-                let option_name = self.identifier()?;
-                self.expect_symbol('=')?;
-                let option_value = self.option_value()?;
-                if option_name == OPTION_PACKED {
+                let option = self.option_setting()?;
+                if option.name == OPTION_PACKED {
                     if packed.is_some() {
                         return Err(Error::new(self.offset(), "duplicate packed option"));
                     }
-                    packed = match option_value.as_str() {
+                    packed = match option.value.as_str() {
                         BOOLEAN_TRUE => Some(true),
                         BOOLEAN_FALSE => Some(false),
                         _ => {
@@ -1136,12 +1618,13 @@ impl DescriptorBuilder {
                         }
                     };
                     packed_explicit = true;
-                } else if option_name == OPTION_DEFAULT {
+                } else if option.name == OPTION_DEFAULT {
                     if default.is_some() {
                         return Err(Error::new(self.offset(), "duplicate default option"));
                     }
-                    default = Some(option_value)
+                    default = Some(option.value.clone())
                 }
+                options.push(option);
                 if !self.consume_symbol(']') {
                     self.expect_symbol(',')?;
                 } else {
@@ -1198,6 +1681,7 @@ impl DescriptorBuilder {
             oneof,
             explicit_presence,
             default,
+            options,
         })
     }
     /// Parses a built-in scalar type or records a user-defined type for resolution.
@@ -1255,6 +1739,454 @@ fn validate_reserved_declarations(reserved: &ReservedDeclarations, offset: usize
     Ok(())
 }
 
+/// Descriptor scope used to validate built-in and custom option placement.
+#[derive(Clone, Copy)]
+enum OptionTarget {
+    File,
+    Message,
+    Field,
+    Oneof,
+    Enum,
+    EnumValue,
+    Service,
+    Method,
+}
+
+/// Scalar category required by one built-in protobuf option.
+#[derive(Clone, Copy)]
+enum BuiltinOptionType {
+    Bool,
+    String,
+    Identifier,
+    AnyScalar,
+    /// Scalar or aggregate value whose detailed shape belongs to a descriptor message.
+    Any,
+}
+
+/// Returns the type of a built-in option valid at the supplied scope.
+fn builtin_option_type(target: OptionTarget, name: &str) -> Option<BuiltinOptionType> {
+    use BuiltinOptionType::{Any, AnyScalar, Bool, Identifier, String as StringOption};
+    match target {
+        OptionTarget::File => match name {
+            "java_package"
+            | "java_outer_classname"
+            | "go_package"
+            | "objc_class_prefix"
+            | "csharp_namespace"
+            | "swift_prefix"
+            | "php_class_prefix"
+            | "php_namespace"
+            | "php_metadata_namespace"
+            | "ruby_package" => Some(StringOption),
+            "java_multiple_files"
+            | "java_generate_equals_and_hash"
+            | "java_string_check_utf8"
+            | "cc_generic_services"
+            | "java_generic_services"
+            | "py_generic_services"
+            | "php_generic_services"
+            | "deprecated"
+            | "cc_enable_arenas" => Some(Bool),
+            "optimize_for" => Some(Identifier),
+            _ => None,
+        },
+        OptionTarget::Message => match name {
+            "message_set_wire_format"
+            | "no_standard_descriptor_accessor"
+            | "deprecated"
+            | "map_entry"
+            | "deprecated_legacy_json_field_conflicts" => Some(Bool),
+            _ => None,
+        },
+        OptionTarget::Field => match name {
+            OPTION_PACKED | "lazy" | "unverified_lazy" | "deprecated" | "weak" | "debug_redact" => {
+                Some(Bool)
+            }
+            OPTION_DEFAULT => Some(AnyScalar),
+            "json_name" => Some(StringOption),
+            "ctype" | "jstype" | "retention" => Some(Identifier),
+            "targets" => Some(Identifier),
+            "edition_defaults" | "feature_support" => Some(Any),
+            _ => None,
+        },
+        OptionTarget::Oneof => None,
+        OptionTarget::Enum => match name {
+            OPTION_ALLOW_ALIAS | "deprecated" | "deprecated_legacy_json_field_conflicts" => {
+                Some(Bool)
+            }
+            _ => None,
+        },
+        OptionTarget::EnumValue => match name {
+            "deprecated" | "debug_redact" => Some(Bool),
+            "feature_support" => Some(Any),
+            _ => None,
+        },
+        OptionTarget::Service => match name {
+            "deprecated" => Some(Bool),
+            _ => None,
+        },
+        OptionTarget::Method => match name {
+            "deprecated" => Some(Bool),
+            "idempotency_level" => Some(Identifier),
+            _ => None,
+        },
+    }
+}
+
+/// Validates built-in option names, scopes, scalar categories, and duplicates.
+fn validate_options(options: &[OptionSetting], target: OptionTarget) -> Result<()> {
+    for (index, option) in options.iter().enumerate() {
+        if option.name.starts_with('(') {
+            continue;
+        }
+        let expected = builtin_option_type(target, &option.name).ok_or_else(|| {
+            Error::new(0, format!("unknown or misplaced option: {}", option.name))
+        })?;
+        if options[..index]
+            .iter()
+            .any(|previous| previous.name == option.name)
+        {
+            return Err(Error::new(0, format!("duplicate option: {}", option.name)));
+        }
+        let valid = match expected {
+            BuiltinOptionType::Bool => {
+                option.value_kind == OptionValueKind::Identifier
+                    && matches!(option.value.as_str(), BOOLEAN_TRUE | BOOLEAN_FALSE)
+            }
+            BuiltinOptionType::String => option.value_kind == OptionValueKind::String,
+            BuiltinOptionType::Identifier => option.value_kind == OptionValueKind::Identifier,
+            BuiltinOptionType::AnyScalar => option.value_kind != OptionValueKind::Aggregate,
+            BuiltinOptionType::Any => true,
+        };
+        if !valid {
+            return Err(Error::new(
+                0,
+                format!("invalid value for option: {}", option.name),
+            ));
+        }
+        if option.name == "optimize_for"
+            && !matches!(
+                option.value.as_str(),
+                "SPEED" | "CODE_SIZE" | "LITE_RUNTIME"
+            )
+        {
+            return Err(Error::new(0, "invalid optimize_for value"));
+        }
+        if option.name == "ctype"
+            && !matches!(option.value.as_str(), "STRING" | "CORD" | "STRING_PIECE")
+        {
+            return Err(Error::new(0, "invalid ctype value"));
+        }
+        if option.name == "jstype"
+            && !matches!(
+                option.value.as_str(),
+                "JS_NORMAL" | "JS_STRING" | "JS_NUMBER"
+            )
+        {
+            return Err(Error::new(0, "invalid jstype value"));
+        }
+        if option.name == "idempotency_level"
+            && !matches!(
+                option.value.as_str(),
+                "IDEMPOTENCY_UNKNOWN" | "NO_SIDE_EFFECTS" | "IDEMPOTENT"
+            )
+        {
+            return Err(Error::new(0, "invalid idempotency_level value"));
+        }
+    }
+    Ok(())
+}
+
+/// Returns whether a proto3 extension targets a descriptor option message.
+fn is_custom_option_extendee(name: &str) -> bool {
+    matches!(
+        name,
+        "google.protobuf.FileOptions"
+            | "google.protobuf.MessageOptions"
+            | "google.protobuf.FieldOptions"
+            | "google.protobuf.OneofOptions"
+            | "google.protobuf.EnumOptions"
+            | "google.protobuf.EnumValueOptions"
+            | "google.protobuf.ServiceOptions"
+            | "google.protobuf.MethodOptions"
+            | "google.protobuf.ExtensionRangeOptions"
+    )
+}
+
+/// Returns the descriptor options message corresponding to one option scope.
+fn option_target_extendee(target: OptionTarget) -> &'static str {
+    match target {
+        OptionTarget::File => "google.protobuf.FileOptions",
+        OptionTarget::Message => "google.protobuf.MessageOptions",
+        OptionTarget::Field => "google.protobuf.FieldOptions",
+        OptionTarget::Oneof => "google.protobuf.OneofOptions",
+        OptionTarget::Enum => "google.protobuf.EnumOptions",
+        OptionTarget::EnumValue => "google.protobuf.EnumValueOptions",
+        OptionTarget::Service => "google.protobuf.ServiceOptions",
+        OptionTarget::Method => "google.protobuf.MethodOptions",
+    }
+}
+
+/// Splits `(extension.name).field.path` into its extension and message path.
+fn custom_option_parts(name: &str) -> Option<(&str, &str)> {
+    let contents = name.strip_prefix('(')?;
+    let closing = contents.find(')')?;
+    let extension = &contents[..closing];
+    let suffix = contents.get(closing + 1..)?;
+    Some((extension, suffix.strip_prefix('.').unwrap_or(suffix)))
+}
+
+/// Resolves a custom-option extension with protobuf lexical name lookup.
+fn resolve_custom_option<'a>(
+    source_name: &str,
+    scope: &str,
+    options: &'a BTreeMap<String, CustomOptionDescriptor>,
+) -> Option<&'a CustomOptionDescriptor> {
+    let absolute = source_name.starts_with('.');
+    let raw = source_name.trim_start_matches('.');
+    if absolute {
+        return options.get(raw);
+    }
+    let mut current = scope;
+    loop {
+        let candidate = if current.is_empty() {
+            raw.to_string()
+        } else {
+            format!("{current}.{raw}")
+        };
+        if let Some(option) = options.get(&candidate) {
+            return Some(option);
+        }
+        let Some((parent, _)) = current.rsplit_once('.') else {
+            break;
+        };
+        current = parent;
+    }
+    options.get(raw)
+}
+
+/// Resolves a custom option's optional message-field suffix to its final type.
+fn custom_option_value_type<'a>(
+    descriptor: &'a CustomOptionDescriptor,
+    path: &str,
+    messages: &'a BTreeMap<String, MessageDescriptor>,
+) -> Result<&'a FieldType> {
+    let mut field_type = &descriptor.field.kind;
+    if path.is_empty() {
+        return Ok(field_type);
+    }
+    for component in path.split('.') {
+        let FieldType::Message(message_name) = field_type else {
+            return Err(Error::new(0, "custom option path traverses a scalar value"));
+        };
+        let message = messages.get(message_name).ok_or_else(|| {
+            Error::new(0, format!("unknown custom option message: {message_name}"))
+        })?;
+        field_type = &message
+            .field_by_name(component)
+            .ok_or_else(|| Error::new(0, format!("unknown custom option field: {component}")))?
+            .kind;
+    }
+    Ok(field_type)
+}
+
+/// Reports whether an option literal has the lexical category required by a field.
+fn custom_option_value_is_valid(
+    field_type: &FieldType,
+    kind: OptionValueKind,
+    value: &str,
+) -> bool {
+    match field_type {
+        FieldType::Bool => {
+            kind == OptionValueKind::Identifier && matches!(value, BOOLEAN_TRUE | BOOLEAN_FALSE)
+        }
+        FieldType::String | FieldType::Bytes => kind == OptionValueKind::String,
+        FieldType::Enum(_) => matches!(kind, OptionValueKind::Identifier | OptionValueKind::Number),
+        FieldType::Message(_) => kind == OptionValueKind::Aggregate,
+        FieldType::Map(..) => false,
+        _ => kind == OptionValueKind::Number,
+    }
+}
+
+/// Validates custom-option lookup, placement, duplication, paths, and values.
+fn validate_custom_options(
+    settings: &[OptionSetting],
+    target: OptionTarget,
+    scope: &str,
+    options: &BTreeMap<String, CustomOptionDescriptor>,
+    messages: &BTreeMap<String, MessageDescriptor>,
+) -> Result<()> {
+    for (index, setting) in settings.iter().enumerate() {
+        let Some((extension_name, path)) = custom_option_parts(&setting.name) else {
+            continue;
+        };
+        let descriptor = resolve_custom_option(extension_name, scope, options)
+            .ok_or_else(|| Error::new(0, format!("unknown custom option: {}", setting.name)))?;
+        if descriptor.extendee != option_target_extendee(target) {
+            return Err(Error::new(
+                0,
+                format!("custom option is not valid at this scope: {}", setting.name),
+            ));
+        }
+        if descriptor.field.cardinality != Cardinality::Repeated
+            && settings[..index]
+                .iter()
+                .any(|previous| previous.name == setting.name)
+        {
+            return Err(Error::new(
+                0,
+                format!("duplicate custom option: {}", setting.name),
+            ));
+        }
+        let field_type = custom_option_value_type(descriptor, path, messages)?;
+        if !custom_option_value_is_valid(field_type, setting.value_kind, &setting.value) {
+            return Err(Error::new(
+                0,
+                format!("invalid value for custom option: {}", setting.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates every retained option at its protobuf descriptor scope.
+fn validate_schema_options(
+    schema: &Schema,
+    custom_options: &BTreeMap<String, CustomOptionDescriptor>,
+    messages: &BTreeMap<String, MessageDescriptor>,
+) -> Result<()> {
+    let file_scope = schema.package.as_deref().unwrap_or("");
+    validate_options(&schema.options, OptionTarget::File)?;
+    validate_custom_options(
+        &schema.options,
+        OptionTarget::File,
+        file_scope,
+        custom_options,
+        messages,
+    )?;
+    for message in schema.messages.values() {
+        validate_options(&message.options, OptionTarget::Message)?;
+        validate_custom_options(
+            &message.options,
+            OptionTarget::Message,
+            &message.full_name,
+            custom_options,
+            messages,
+        )?;
+        for oneof in &message.oneofs {
+            validate_options(&oneof.options, OptionTarget::Oneof)?;
+            validate_custom_options(
+                &oneof.options,
+                OptionTarget::Oneof,
+                &message.full_name,
+                custom_options,
+                messages,
+            )?;
+        }
+        for field in &message.fields {
+            validate_options(&field.options, OptionTarget::Field)?;
+            validate_custom_options(
+                &field.options,
+                OptionTarget::Field,
+                &message.full_name,
+                custom_options,
+                messages,
+            )?;
+        }
+    }
+    for enumeration in schema.enums.values() {
+        validate_options(&enumeration.options, OptionTarget::Enum)?;
+        validate_custom_options(
+            &enumeration.options,
+            OptionTarget::Enum,
+            &enumeration.full_name,
+            custom_options,
+            messages,
+        )?;
+        for value in &enumeration.values {
+            validate_options(&value.options, OptionTarget::EnumValue)?;
+            validate_custom_options(
+                &value.options,
+                OptionTarget::EnumValue,
+                &enumeration.full_name,
+                custom_options,
+                messages,
+            )?;
+        }
+    }
+    for service in schema.services.values() {
+        validate_options(&service.options, OptionTarget::Service)?;
+        validate_custom_options(
+            &service.options,
+            OptionTarget::Service,
+            &service.full_name,
+            custom_options,
+            messages,
+        )?;
+        for method in &service.methods {
+            validate_options(&method.options, OptionTarget::Method)?;
+            validate_custom_options(
+                &method.options,
+                OptionTarget::Method,
+                &service.full_name,
+                custom_options,
+                messages,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Derives the JSON spelling used by protobuf reflection for one field.
+///
+/// An explicit `json_name` takes precedence. Otherwise underscores are
+/// removed and the following ASCII letter is capitalized, matching protoc's
+/// lower-camel-case transformation for protobuf identifiers.
+fn field_json_name(field: &Field) -> String {
+    if let Some(option) = field
+        .options
+        .iter()
+        .find(|option| option.name == "json_name")
+    {
+        return option.value.clone();
+    }
+    let mut name = String::new();
+    let mut capitalize = false;
+    for character in field.name.chars() {
+        if character == '_' {
+            capitalize = true;
+        } else if capitalize {
+            name.push(character.to_ascii_uppercase());
+            capitalize = false;
+        } else {
+            name.push(character);
+        }
+    }
+    name
+}
+
+/// Rejects proto3 fields that become ambiguous through their JSON names.
+///
+/// Binary tags remain distinct in this situation, but protobuf JSON parsers
+/// could map one input property to multiple fields. Protoc rejects the schema,
+/// so the dynamic descriptor builder applies the same semantic rule even
+/// though this crate does not currently implement JSON serialization.
+fn validate_json_field_names(fields: &[Field], offset: usize) -> Result<()> {
+    for (index, field) in fields.iter().enumerate() {
+        let json_name = field_json_name(field);
+        if fields[..index]
+            .iter()
+            .any(|previous| field_json_name(previous) == json_name)
+        {
+            return Err(Error::new(
+                offset,
+                format!("duplicate proto3 JSON field name: {json_name}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validates field uniqueness, oneof names, and reserved declarations in a message.
 fn validate_message_fields(
     fields: &[Field],
@@ -1305,7 +2237,10 @@ fn parse_file(source: &str) -> Result<Schema> {
         package: None,
         messages: BTreeMap::new(),
         enums: BTreeMap::new(),
+        services: BTreeMap::new(),
+        custom_options: BTreeMap::new(),
         imports: Vec::new(),
+        options: Vec::new(),
     };
     let mut seen_syntax = false;
     let mut seen_package = false;
@@ -1370,12 +2305,20 @@ fn parse_file(source: &str) -> Result<Schema> {
         } else if parser.peek_identifier(KW_ENUM) {
             seen_non_syntax = true;
             parser.parse_enum("")?
-        } else if parser.peek_identifier(KW_OPTION)
-            || parser.peek_identifier(KW_SERVICE)
-            || (parser.peek_identifier(KW_EXTEND) && parser.syntax == Syntax::Proto2)
-        {
+        } else if parser.peek_identifier(KW_SERVICE) {
             seen_non_syntax = true;
-            parser.skip_declaration()?
+            parser.parse_service()?
+        } else if parser.peek_identifier(KW_OPTION) {
+            seen_non_syntax = true;
+            let option = parser.option_declaration()?;
+            parser.options.push(option)
+        } else if parser.peek_identifier(KW_EXTEND) {
+            seen_non_syntax = true;
+            if parser.syntax == Syntax::Proto3 {
+                parser.parse_custom_option_extensions("")?
+            } else {
+                parser.skip_declaration()?
+            }
         } else if parser.consume_symbol(';') {
             seen_non_syntax = true;
         } else {
@@ -1390,7 +2333,10 @@ fn parse_file(source: &str) -> Result<Schema> {
         package: parser.package,
         messages: parser.messages,
         enums: parser.enums,
+        services: parser.services,
+        custom_options: parser.custom_options,
         imports: parser.imports,
+        options: parser.options,
     })
 }
 
@@ -1435,51 +2381,51 @@ fn parse_registry(root: &str, registry: &Registry) -> Result<Schema> {
         }
         files.insert(path, file);
     }
+    validate_import_cycles(root, &files, &mut BTreeMap::new())?;
 
     let paths: Vec<String> = files.keys().cloned().collect();
+    let mut visibility = BTreeMap::<String, Vec<String>>::new();
     for path in &paths {
-        let file = files
+        visibility.insert(path.clone(), visible_import_paths(path, &files)?);
+    }
+    for path in &paths {
+        let visible_paths = visibility
             .get(path)
-            .ok_or_else(|| Error::new(0, "registered source disappeared"))?;
-        let mut visible_paths = alloc::vec![path.clone()];
-        let mut public_frontier = Vec::<String>::new();
-        for import in &file.imports {
-            if files.contains_key(&import.path) && !visible_paths.contains(&import.path) {
-                visible_paths.push(import.path.clone());
-                public_frontier.push(import.path.clone());
-            }
-        }
-        while let Some(imported_path) = public_frontier.pop() {
-            let imported = files
-                .get(&imported_path)
-                .ok_or_else(|| Error::new(0, "visible import disappeared"))?;
-            for public_import in imported
-                .imports
-                .iter()
-                .filter(|import| import.kind == ImportKind::Public)
-            {
-                if files.contains_key(&public_import.path)
-                    && !visible_paths.contains(&public_import.path)
-                {
-                    visible_paths.push(public_import.path.clone());
-                    public_frontier.push(public_import.path.clone());
-                }
-            }
-        }
-        let mut visible_messages = Vec::<String>::new();
-        let mut visible_enums = Vec::<String>::new();
-        for visible_path in &visible_paths {
+            .ok_or_else(|| Error::new(0, "import visibility disappeared"))?;
+        let mut visible_messages = BTreeMap::<String, MessageDescriptor>::new();
+        let mut visible_enums = BTreeMap::<String, Syntax>::new();
+        for visible_path in visible_paths {
             let visible = files
                 .get(visible_path)
                 .ok_or_else(|| Error::new(0, "visible source disappeared"))?;
-            visible_messages.extend(visible.messages.keys().cloned());
-            visible_enums.extend(visible.enums.keys().cloned());
+            visible_messages.extend(visible.messages.clone());
+            for (name, enumeration) in &visible.enums {
+                visible_enums.insert(name.clone(), enumeration.syntax);
+            }
         }
         let file = files
             .get_mut(path)
             .ok_or_else(|| Error::new(0, "registered source disappeared"))?;
         validate_symbol_namespaces(file)?;
-        resolve_schema_with_symbols(file, &visible_messages, &visible_enums)?;
+        resolve_schema_declarations(file, &visible_messages, &visible_enums)?;
+    }
+    for path in &paths {
+        let visible_paths = visibility
+            .get(path)
+            .ok_or_else(|| Error::new(0, "import visibility disappeared"))?;
+        let mut visible_messages = BTreeMap::<String, MessageDescriptor>::new();
+        let mut visible_custom_options = BTreeMap::<String, CustomOptionDescriptor>::new();
+        for visible_path in visible_paths {
+            let visible = files
+                .get(visible_path)
+                .ok_or_else(|| Error::new(0, "visible source disappeared"))?;
+            visible_messages.extend(visible.messages.clone());
+            visible_custom_options.extend(visible.custom_options.clone());
+        }
+        let file = files
+            .get(path)
+            .ok_or_else(|| Error::new(0, "registered source disappeared"))?;
+        validate_schema_options(file, &visible_custom_options, &visible_messages)?;
     }
 
     let mut schema = files
@@ -1496,10 +2442,83 @@ fn parse_registry(root: &str, registry: &Registry) -> Result<Schema> {
                 return Err(Error::new(0, format!("duplicate enum: {name}")));
             }
         }
+        for (name, service) in file.services {
+            if schema.services.insert(name.clone(), service).is_some() {
+                return Err(Error::new(0, format!("duplicate service: {name}")));
+            }
+        }
+        for (name, option) in file.custom_options {
+            if schema.custom_options.contains_key(&name)
+                || schema.custom_options.values().any(|existing| {
+                    existing.extendee == option.extendee
+                        && existing.field.number == option.field.number
+                })
+            {
+                return Err(Error::new(0, format!("duplicate custom option: {name}")));
+            }
+            schema.custom_options.insert(name, option);
+        }
         schema.imports.extend(file.imports);
     }
     validate_symbol_namespaces(&schema)?;
     Ok(schema)
+}
+
+/// Computes direct and publicly re-exported declarations visible to one file.
+fn visible_import_paths(path: &str, files: &BTreeMap<String, Schema>) -> Result<Vec<String>> {
+    let file = files
+        .get(path)
+        .ok_or_else(|| Error::new(0, "registered source disappeared"))?;
+    let mut visible_paths = alloc::vec![path.to_string()];
+    let mut public_frontier = Vec::<String>::new();
+    for import in &file.imports {
+        if files.contains_key(&import.path) && !visible_paths.contains(&import.path) {
+            visible_paths.push(import.path.clone());
+            public_frontier.push(import.path.clone());
+        }
+    }
+    while let Some(imported_path) = public_frontier.pop() {
+        let imported = files
+            .get(&imported_path)
+            .ok_or_else(|| Error::new(0, "visible import disappeared"))?;
+        for public_import in imported
+            .imports
+            .iter()
+            .filter(|import| import.kind == ImportKind::Public)
+        {
+            if files.contains_key(&public_import.path)
+                && !visible_paths.contains(&public_import.path)
+            {
+                visible_paths.push(public_import.path.clone());
+                public_frontier.push(public_import.path.clone());
+            }
+        }
+    }
+    Ok(visible_paths)
+}
+
+/// Rejects cycles in the reachable registry import graph.
+fn validate_import_cycles(
+    path: &str,
+    files: &BTreeMap<String, Schema>,
+    states: &mut BTreeMap<String, u8>,
+) -> Result<()> {
+    match states.get(path) {
+        Some(1) => return Err(Error::new(0, format!("cyclic protobuf import: {path}"))),
+        Some(2) => return Ok(()),
+        _ => {}
+    }
+    states.insert(path.to_string(), 1);
+    let file = files
+        .get(path)
+        .ok_or_else(|| Error::new(0, format!("import not found: {path}")))?;
+    for import in &file.imports {
+        if files.contains_key(&import.path) {
+            validate_import_cycles(&import.path, files, states)?;
+        }
+    }
+    states.insert(path.to_string(), 2);
+    Ok(())
 }
 
 /// Resolves every deferred user-defined type and computes field presence rules.
@@ -1509,20 +2528,37 @@ fn parse_registry(root: &str, registry: &Registry) -> Result<Schema> {
 /// repeated strings, bytes, messages, and maps from using packed encoding.
 fn resolve_schema(schema: &mut Schema) -> Result<()> {
     validate_symbol_namespaces(schema)?;
-    let messages: Vec<String> = schema.messages.keys().cloned().collect();
-    let enums: Vec<String> = schema.enums.keys().cloned().collect();
-    resolve_schema_with_symbols(schema, &messages, &enums)
+    let messages = schema.messages.clone();
+    let enums: BTreeMap<String, Syntax> = schema
+        .enums
+        .iter()
+        .map(|(name, enumeration)| (name.clone(), enumeration.syntax))
+        .collect();
+    resolve_schema_declarations(schema, &messages, &enums)?;
+    let resolved_messages = schema.messages.clone();
+    let custom_options = schema.custom_options.clone();
+    validate_schema_options(schema, &custom_options, &resolved_messages)
 }
 
 /// Resolves fields against the declarations visible from one source file.
-fn resolve_schema_with_symbols(
+fn resolve_schema_declarations(
     schema: &mut Schema,
-    messages: &[String],
-    enums: &[String],
+    messages: &BTreeMap<String, MessageDescriptor>,
+    enums: &BTreeMap<String, Syntax>,
 ) -> Result<()> {
+    let message_names: Vec<String> = messages.keys().cloned().collect();
+    let enum_names: Vec<String> = enums.keys().cloned().collect();
     for descriptor in schema.messages.values_mut() {
         for field in &mut descriptor.fields {
-            resolve(&mut field.kind, &descriptor.full_name, messages, enums)?;
+            resolve(
+                &mut field.kind,
+                &descriptor.full_name,
+                &message_names,
+                &enum_names,
+            )?;
+            if schema.syntax == Syntax::Proto3 {
+                reject_proto2_enum_reference(&field.kind, enums)?;
+            }
             if field.packed_explicit
                 && field.packed == Some(true)
                 && matches!(
@@ -1562,7 +2598,74 @@ fn resolve_schema_with_symbols(
             }
         }
     }
+    for option in schema.custom_options.values_mut() {
+        if !messages.contains_key(&option.extendee) {
+            return Err(Error::new(
+                0,
+                format!("custom option extendee is not visible: {}", option.extendee),
+            ));
+        }
+        let scope = option
+            .full_name
+            .rsplit_once('.')
+            .map_or("", |(parent, _)| parent);
+        resolve(&mut option.field.kind, scope, &message_names, &enum_names)?;
+        validate_options(&option.field.options, OptionTarget::Field)?;
+    }
+    for service in schema.services.values_mut() {
+        for method in &mut service.methods {
+            method.input_type = resolve_rpc_message(
+                &method.input_type,
+                &service.full_name,
+                &message_names,
+                &enum_names,
+            )?;
+            method.output_type = resolve_rpc_message(
+                &method.output_type,
+                &service.full_name,
+                &message_names,
+                &enum_names,
+            )?;
+        }
+    }
     Ok(())
+}
+
+/// Rejects proto2 enum types referenced from a proto3 source file.
+fn reject_proto2_enum_reference(
+    field_type: &FieldType,
+    enums: &BTreeMap<String, Syntax>,
+) -> Result<()> {
+    match field_type {
+        FieldType::Enum(name) if enums.get(name) == Some(&Syntax::Proto2) => Err(Error::new(
+            0,
+            format!("proto3 field cannot reference proto2 enum: {name}"),
+        )),
+        FieldType::Map(key, value) => {
+            reject_proto2_enum_reference(key, enums)?;
+            reject_proto2_enum_reference(value, enums)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Resolves an RPC endpoint and requires it to name a message declaration.
+fn resolve_rpc_message(
+    source_name: &str,
+    scope: &str,
+    messages: &[String],
+    enums: &[String],
+) -> Result<String> {
+    let mut field_type = FieldType::Message(source_name.to_string());
+    resolve(&mut field_type, scope, messages, enums)?;
+    match field_type {
+        FieldType::Message(name) => Ok(name),
+        FieldType::Enum(name) => Err(Error::new(
+            0,
+            format!("rpc endpoint must be a message, not enum: {name}"),
+        )),
+        _ => Err(Error::new(0, "rpc endpoint must be a message")),
+    }
 }
 
 /// Validates protobuf's shared declaration namespaces before type resolution.
@@ -1578,6 +2681,22 @@ fn validate_symbol_namespaces(schema: &Schema) -> Result<()> {
     }
     for name in schema.enums.keys() {
         if symbols.insert(name.clone(), "enum").is_some() {
+            return Err(Error::new(
+                0,
+                format!("conflicting declaration name: {name}"),
+            ));
+        }
+    }
+    for name in schema.services.keys() {
+        if symbols.insert(name.clone(), "service").is_some() {
+            return Err(Error::new(
+                0,
+                format!("conflicting declaration name: {name}"),
+            ));
+        }
+    }
+    for name in schema.custom_options.keys() {
+        if symbols.insert(name.clone(), "custom option").is_some() {
             return Err(Error::new(
                 0,
                 format!("conflicting declaration name: {name}"),

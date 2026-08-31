@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Completed proto3 service and RPC descriptors, built-in and custom option
+  retention and validation, JSON-name collision checks, and cross-file custom
+  option resolution.
+- Added safe recursive preservation of unknown wire groups, moving 14 official
+  conformance cases from skipped to passing.
+
+### Changed
+
+- Registry parsing now rejects import cycles and proto3 references to proto2
+  enums, and resolves declarations before validating imported option uses.
+
 ### Documentation
 
 - Added a precise conformance test suite statement covering passing cases,
