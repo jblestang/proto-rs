@@ -60,6 +60,7 @@ jobs:
             --silent \
             --output /dev/null \
             --write-out '%{http_code}' \
+            --user-agent 'proto-rs-dynamic-release-check (https://github.com/jblestang/proto-rs)' \
             "https://crates.io/api/v1/crates/${PACKAGE_NAME}/${PACKAGE_VERSION}")"
           case "$status" in
             200) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
